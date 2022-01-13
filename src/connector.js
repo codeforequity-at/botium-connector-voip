@@ -1,12 +1,5 @@
-const util = require('util')
-const url = require('url')
 const { v4: uuidv4 } = require('uuid')
 const WebSocket = require('ws')
-const _ = require('lodash')
-const Mustache = require('mustache')
-const jp = require('jsonpath')
-const mime = require('mime-types')
-const HttpsProxyAgent = require('https-proxy-agent')
 const debug = require('debug')('botium-connector-voip')
 
 const Capabilities = {
@@ -33,7 +26,7 @@ const Capabilities = {
 
 const Defaults = {
   VOIP_STT_METHOD: 'POST',
-  VOIP_STT_TIMEOUT: 10000,
+  VOIP_STT_TIMEOUT: 10000
 }
 
 class BotiumConnectorVoip {
@@ -63,7 +56,7 @@ class BotiumConnectorVoip {
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.caps[Capabilities.VOIP_WORKER_URL])
 
-      if(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
+      if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
         this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
       } else {
         this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = this.caps[Capabilities.VOIP_ICE_STUN_SERVERS].split(',')
@@ -74,23 +67,23 @@ class BotiumConnectorVoip {
         this.wsOpened = true
         debug(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_ENDPOINT]} opened.`)
         const request = {
-            "METHOD": "initCall",
-            "API_KEY": this.caps[Capabilities.VOIP_WORKER_APIKEY],
-            "SIP_CALLER_AUTO": this.caps[Capabilities.VOIP_SIP_POOL_CALLER_ENABLE],
-            "SIP_CALLEE_URI": this.caps[Capabilities.VOIP_SIP_CALLEE_URI],
-            "SIP_REG_HEADERS": this.caps[Capabilities.VOIP_SIP_REG_HEADERS],
-            "SIP_INVITE_HEADERS": this.caps[Capabilities.VOIP_SIP_INVITE_HEADERS],
-            "ICE_ENABLE": this.caps[Capabilities.VOIP_ICE_ENABLE],
-            "ICE_STUN_SERVERS": this.caps[Capabilities.VOIP_ICE_STUN_SERVERS],
-            "ICE_TURN_SERVER": this.caps[Capabilities.VOIP_ICE_TURN_SERVER],
-            "ICE_TURN_USERNAME": this.caps[Capabilities.VOIP_ICE_TURN_USER],
-            "ICE_TURN_PASSWORD": this.caps[Capabilities.VOIP_ICE_TURN_PASSWORD],
-            "ICE_TURN_PROTOCOL": this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
-            "STT_CONFIG": {
-              "stt_url": this.caps[Capabilities.VOIP_STT_URL_STREAM],
-              "stt_params": this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
-              "stt_body": this.caps[Capabilities.VOIP_STT_BODY_STREAM] || null
-            }
+          METHOD: 'initCall',
+          API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY],
+          SIP_CALLER_AUTO: this.caps[Capabilities.VOIP_SIP_POOL_CALLER_ENABLE],
+          SIP_CALLEE_URI: this.caps[Capabilities.VOIP_SIP_CALLEE_URI],
+          SIP_REG_HEADERS: this.caps[Capabilities.VOIP_SIP_REG_HEADERS],
+          SIP_INVITE_HEADERS: this.caps[Capabilities.VOIP_SIP_INVITE_HEADERS],
+          ICE_ENABLE: this.caps[Capabilities.VOIP_ICE_ENABLE],
+          ICE_STUN_SERVERS: this.caps[Capabilities.VOIP_ICE_STUN_SERVERS],
+          ICE_TURN_SERVER: this.caps[Capabilities.VOIP_ICE_TURN_SERVER],
+          ICE_TURN_USERNAME: this.caps[Capabilities.VOIP_ICE_TURN_USER],
+          ICE_TURN_PASSWORD: this.caps[Capabilities.VOIP_ICE_TURN_PASSWORD],
+          ICE_TURN_PROTOCOL: this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
+          STT_CONFIG: {
+            stt_url: this.caps[Capabilities.VOIP_STT_URL_STREAM],
+            stt_params: this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
+            stt_body: this.caps[Capabilities.VOIP_STT_BODY_STREAM] || null
+          }
         }
         debug(request)
         this.ws.send(JSON.stringify(request))
@@ -138,32 +131,30 @@ class BotiumConnectorVoip {
     debug(msg)
 
     setTimeout(() => {
-
       if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
         msg.userInputs.forEach((userInput, index) => {
           const request = JSON.stringify({
-              "METHOD": "sendAudio",
-              "PESQ": userInput.args.filter(a => a.includes(';PESQ')).length > 0,
-              "sessionId": this.sessionId,
-              "b64_buffer": msg.media[index].buffer.toString('base64')
+            METHOD: 'sendAudio',
+            PESQ: userInput.args.filter(a => a.includes(';PESQ')).length > 0,
+            sessionId: this.sessionId,
+            b64_buffer: msg.media[index].buffer.toString('base64')
           })
           this.ws.send(request)
         })
       }
     }, 500)
-
   }
 
   async Stop () {
     debug('Stop called')
     try {
       const request = JSON.stringify({
-          "METHOD": "stopCall",
-          "sessionId": this.sessionId
+        METHOD: 'stopCall',
+        sessionId: this.sessionId
       })
       this.ws.send(request)
-      await new Promise(resolve => setTimeout(resolve, 2000));
-    } catch(e) {
+      await new Promise(resolve => setTimeout(resolve, 2000))
+    } catch (e) {
       debug('Cannot send stopCall method to VOIP-Worker')
     }
 
@@ -174,7 +165,6 @@ class BotiumConnectorVoip {
     this.ws = null
     this.view = {}
   }
-
 }
 
 module.exports = BotiumConnectorVoip
