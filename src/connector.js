@@ -17,6 +17,7 @@ const Capabilities = {
   VOIP_STT_HEADERS: 'VOIP_STT_HEADERS',
   VOIP_STT_TIMEOUT: 'VOIP_STT_TIMEOUT',
   VOIP_WORKER_URL: 'VOIP_WORKER_URL',
+  VOIP_WORKER_APIKEY: 'VOIP_WORKER_APIKEY',
   VOIP_SIP_POOL_CALLER_ENABLE: 'VOIP_SIP_POOL_CALLER_ENABLE',
   VOIP_SIP_REG_HEADERS: 'VOIP_SIP_REG_HEADERS',
   VOIP_SIP_INVITE_HEADERS: 'VOIP_SIP_INVITE_HEADERS',
@@ -74,6 +75,7 @@ class BotiumConnectorVoip {
         debug(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_ENDPOINT]} opened.`)
         const request = {
             "METHOD": "initCall",
+            "API_KEY": this.caps[Capabilities.VOIP_WORKER_APIKEY],
             "SIP_CALLER_AUTO": this.caps[Capabilities.VOIP_SIP_POOL_CALLER_ENABLE],
             "SIP_CALLEE_URI": this.caps[Capabilities.VOIP_SIP_CALLEE_URI],
             "SIP_REG_HEADERS": this.caps[Capabilities.VOIP_SIP_REG_HEADERS],
@@ -110,6 +112,10 @@ class BotiumConnectorVoip {
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
           this.sessionId = parsedData.voipConfig.sessionId
+        }
+
+        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden') {
+          reject(new Error('Cannot connect to VOIP Worker because of wrong APi key'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
