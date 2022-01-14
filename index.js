@@ -15,6 +15,12 @@ module.exports = {
         label: 'Speech Recognition Profile',
         type: 'speechrecognitionprofile',
         required: true
+      },
+      {
+        name: 'VOIP_TTS',
+        label: 'Speech Synthesis Profile',
+        type: 'speechsynthesisprofile',
+        required: true
       }
     ]
   }

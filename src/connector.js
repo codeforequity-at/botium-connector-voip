@@ -9,6 +9,12 @@ const Capabilities = {
   VOIP_STT_BODY_STREAM: 'VOIP_STT_BODY_STREAM',
   VOIP_STT_HEADERS: 'VOIP_STT_HEADERS',
   VOIP_STT_TIMEOUT: 'VOIP_STT_TIMEOUT',
+  VOIP_TTS_URL: 'VOIP_TTS_URL',
+  VOIP_TTS_PARAMS: 'VOIP_TTS_PARAMS',
+  VOIP_TTS_METHOD: 'VOIP_TTS_METHOD',
+  VOIP_TTS_BODY: 'VOIP_TTS_BODY',
+  VOIP_TTS_HEADERS: 'VOIP_TTS_HEADERS',
+  VOIP_TTS_TIMEOUT: 'VOIP_TTS_TIMEOUT',
   VOIP_WORKER_URL: 'VOIP_WORKER_URL',
   VOIP_WORKER_APIKEY: 'VOIP_WORKER_APIKEY',
   VOIP_SIP_POOL_CALLER_ENABLE: 'VOIP_SIP_POOL_CALLER_ENABLE',
@@ -26,7 +32,9 @@ const Capabilities = {
 
 const Defaults = {
   VOIP_STT_METHOD: 'POST',
-  VOIP_STT_TIMEOUT: 10000
+  VOIP_STT_TIMEOUT: 10000,
+  VOIP_TTS_METHOD: 'GET',
+  VOIP_TTS_TIMEOUT: 10000
 }
 
 class BotiumConnectorVoip {
@@ -42,6 +50,7 @@ class BotiumConnectorVoip {
 
   async Start () {
     debug('Start called')
+    debug(this.caps[Capabilities.VOIP_TTS_URL])
 
     this.view = {
       container: this,
@@ -83,6 +92,11 @@ class BotiumConnectorVoip {
             stt_url: this.caps[Capabilities.VOIP_STT_URL_STREAM],
             stt_params: this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
             stt_body: this.caps[Capabilities.VOIP_STT_BODY_STREAM] || null
+          },
+          TTS_CONFIG: {
+            tts_url: this.caps[Capabilities.VOIP_TTS_URL],
+            tts_params: this.caps[Capabilities.VOIP_TTS_PARAMS],
+            tts_body: this.caps[Capabilities.VOIP_TTS_BODY] || null
           }
         }
         debug(request)
@@ -131,6 +145,14 @@ class BotiumConnectorVoip {
     debug(msg)
 
     setTimeout(() => {
+      if (msg && msg.messageText) {
+        const request = JSON.stringify({
+          METHOD: 'sendTTS',
+          sessionId: this.sessionId,
+          message: msg.messageText
+        })
+        this.ws.send(request)
+      }
       if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
         msg.userInputs.forEach((userInput, index) => {
           const request = JSON.stringify({
