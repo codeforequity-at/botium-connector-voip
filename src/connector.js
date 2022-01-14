@@ -1,5 +1,6 @@
 const { v4: uuidv4 } = require('uuid')
 const WebSocket = require('ws')
+const _ = require('lodash')
 const debug = require('debug')('botium-connector-voip')
 
 const Capabilities = {
@@ -65,10 +66,12 @@ class BotiumConnectorVoip {
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.caps[Capabilities.VOIP_WORKER_URL])
 
-      if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
-        this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
-      } else {
-        this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = this.caps[Capabilities.VOIP_ICE_STUN_SERVERS].split(',')
+      if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
+        if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
+          this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
+        } else {
+          this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = this.caps[Capabilities.VOIP_ICE_STUN_SERVERS].split(',')
+        }
       }
 
       this.wsOpened = false
@@ -169,16 +172,17 @@ class BotiumConnectorVoip {
 
   async Stop () {
     debug('Stop called')
+    /* const request = JSON.stringify({
+      METHOD: 'stopCall',
+      sessionId: this.sessionId
+    })
+    this.ws.send(request)
+    await new Promise(resolve => setTimeout(resolve, 2000))
     try {
-      const request = JSON.stringify({
-        METHOD: 'stopCall',
-        sessionId: this.sessionId
-      })
-      this.ws.send(request)
-      await new Promise(resolve => setTimeout(resolve, 2000))
+
     } catch (e) {
       debug('Cannot send stopCall method to VOIP-Worker')
-    }
+    } */
 
     if (this.ws) {
       this.ws.close()
