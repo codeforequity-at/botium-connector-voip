@@ -1,6 +1,7 @@
 const { v4: uuidv4 } = require('uuid')
 const WebSocket = require('ws')
 const _ = require('lodash')
+const axios = require('axios')
 const debug = require('debug')('botium-connector-voip')
 
 const Capabilities = {
@@ -39,13 +40,38 @@ const Defaults = {
 }
 
 class BotiumConnectorVoip {
-  constructor ({ queueBotSays, caps }) {
+  constructor ({ queueBotSays, eventEmitter, caps }) {
     this.queueBotSays = queueBotSays
     this.caps = caps
+    this.eventEmitter = eventEmitter
   }
 
-  Validate () {
+  async Validate () {
     debug('Validate called')
+
+    if (this.caps.VOIP_TTS_URL) {
+      this.axiosTtsParams = {
+        url: this.caps.VOIP_TTS_URL,
+        params: this._getParams(Capabilities.VOIP_TTS_PARAMS),
+        method: this.caps.VOIP_TTS_METHOD,
+        timeout: this.caps.VOIP_TTS_TIMEOUT,
+        headers: this._getHeaders(Capabilities.VOIP_TTS_HEADERS)
+      }
+      try {
+        const { data } = await axios({
+          ...this.axiosTtsParams,
+          url: this._getAxiosUrl(this.caps.VOIP_TTS_URL, '/api/status')
+        })
+        if (data && data.status === 'OK') {
+          debug(`Checking TTS Status response: ${this._getAxiosShortenedOutput(data)}`)
+        } else {
+          throw new Error(`Checking TTS Status failed, response is: ${this._getAxiosShortenedOutput(data)}`)
+        }
+      } catch (err) {
+        throw new Error(`Checking TTS Status failed - ${this._getAxiosErrOutput(err)}`)
+      }
+    }
+
     this.caps = Object.assign({}, Defaults, this.caps)
   }
 
@@ -62,6 +88,9 @@ class BotiumConnectorVoip {
         stepId: null
       }
     }
+
+    this.fullRecord = ''
+    this.end = false
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.caps[Capabilities.VOIP_WORKER_URL])
@@ -132,6 +161,15 @@ class BotiumConnectorVoip {
           resolve()
         }
 
+        if (parsedData && parsedData.type === 'fullRecord') {
+          this.end = true
+          this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
+            name: 'full_record.wav',
+            mimeType: 'audio/wav',
+            base64: parsedData.fullRecord
+          })
+        }
+
         if (parsedData && parsedData.data && parsedData.data.final) {
           const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
           botMsgs.push(botMsg)
@@ -147,14 +185,46 @@ class BotiumConnectorVoip {
 
     debug(msg)
 
-    setTimeout(() => {
+    if (!msg.attachments) {
+      msg.attachments = []
+    }
+    setTimeout(async () => {
       if (msg && msg.messageText) {
-        const request = JSON.stringify({
-          METHOD: 'sendTTS',
-          sessionId: this.sessionId,
-          message: msg.messageText
-        })
-        this.ws.send(request)
+        if (!this.axiosTtsParams) throw new Error('TTS not configured, only audio input supported')
+
+        const ttsRequest = {
+          ...this.axiosTtsParams,
+          params: {
+            ...(this.axiosTtsParams.params || {}),
+            text: msg.messageText
+          },
+          data: this._getBody(Capabilities.BSP_TTS_BODY),
+          responseType: 'arraybuffer'
+        }
+        msg.sourceData = ttsRequest
+
+        let ttsResponse = null
+        try {
+          ttsResponse = await axios(ttsRequest)
+        } catch (err) {
+          throw new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`)
+        }
+        if (Buffer.isBuffer(ttsResponse.data)) {
+          const request = JSON.stringify({
+            METHOD: 'sendAudio',
+            PESQ: false,
+            sessionId: this.sessionId,
+            b64_buffer: ttsResponse.data.toString('base64')
+          })
+          msg.attachments.push({
+            name: 'tts.wav',
+            mimeType: 'audio/wav',
+            base64: ttsResponse.data.toString('base64')
+          })
+          this.ws.send(request)
+        } else {
+          throw new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse.data)}`)
+        }
       }
       if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
         msg.userInputs.forEach((userInput, index) => {
@@ -164,6 +234,11 @@ class BotiumConnectorVoip {
             sessionId: this.sessionId,
             b64_buffer: msg.media[index].buffer.toString('base64')
           })
+          msg.attachments.push({
+            name: msg.media[index].mediaUri,
+            mimeType: msg.media[index].mimeType,
+            base64: msg.media[index].buffer.toString('base64')
+          })
           this.ws.send(request)
         })
       }
@@ -172,17 +247,19 @@ class BotiumConnectorVoip {
 
   async Stop () {
     debug('Stop called')
-    /* const request = JSON.stringify({
+    const request = JSON.stringify({
       METHOD: 'stopCall',
       sessionId: this.sessionId
     })
     this.ws.send(request)
-    await new Promise(resolve => setTimeout(resolve, 2000))
-    try {
-
-    } catch (e) {
-      debug('Cannot send stopCall method to VOIP-Worker')
-    } */
+    await new Promise(resolve => {
+      setTimeout(resolve, 50000)
+      setInterval(() => {
+        if (this.end) {
+          resolve()
+        }
+      }, 1000)
+    })
 
     if (this.ws) {
       this.ws.close()
@@ -190,6 +267,56 @@ class BotiumConnectorVoip {
     this.wsOpened = false
     this.ws = null
     this.view = {}
+  }
+
+  _getParams (capParams) {
+    if (this.caps[capParams]) {
+      if (_.isString(this.caps[capParams])) return JSON.parse(this.caps[capParams])
+      else return this.caps[capParams]
+    }
+    return {}
+  }
+
+  _getBody (capBody) {
+    if (this.caps[capBody]) {
+      if (_.isString(this.caps[capBody])) return JSON.parse(this.caps[capBody])
+      else return this.caps[capBody]
+    }
+    return null
+  }
+
+  _getHeaders (capHeaders) {
+    if (this.caps[capHeaders]) {
+      if (_.isString(this.caps[capHeaders])) return JSON.parse(this.caps[capHeaders])
+      else return this.caps[capHeaders]
+    }
+    return {}
+  }
+
+  _getAxiosUrl (baseUrl, extUrl) {
+    return baseUrl.substr(0, baseUrl.indexOf('/', 8)) + extUrl
+  }
+
+  _getAxiosShortenedOutput (data) {
+    if (data) {
+      if (_.isBuffer(data)) {
+        try {
+          data = data.toString()
+        } catch (err) {
+        }
+      }
+      return _.truncate(_.isString(data) ? data : JSON.stringify(data), { length: 200 })
+    } else {
+      return ''
+    }
+  }
+
+  _getAxiosErrOutput (err) {
+    if (err && err.response) {
+      return `Status: ${err.response.status} / Response: ${this._getAxiosShortenedOutput(err.response.data)}`
+    } else {
+      return err.message
+    }
   }
 }
 
