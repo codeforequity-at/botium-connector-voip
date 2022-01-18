@@ -189,7 +189,14 @@ class BotiumConnectorVoip {
       msg.attachments = []
     }
     setTimeout(async () => {
-      if (msg && msg.messageText) {
+      if (msg && msg.buttons && msg.buttons.length > 0) {
+        const request = JSON.stringify({
+          METHOD: 'sendDtmf',
+          digits: msg.buttons[0].payload,
+          sessionId: this.sessionId
+        })
+        this.ws.send(request)
+      } else if (msg && msg.messageText) {
         if (!this.axiosTtsParams) throw new Error('TTS not configured, only audio input supported')
 
         const ttsRequest = {
