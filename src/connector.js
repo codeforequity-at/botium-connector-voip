@@ -164,8 +164,12 @@ class BotiumConnectorVoip {
           this.sessionId = parsedData.voipConfig.sessionId
         }
 
+        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
+          reject(new Error('Cannot open a call: SIP Authorization failed'))
+        }
+
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden') {
-          reject(new Error('Cannot connect to VOIP Worker because of wrong APi key'))
+          reject(new Error('Cannot connect to VOIP Worker because of wrong API key'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
