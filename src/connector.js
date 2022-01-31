@@ -145,7 +145,7 @@ class BotiumConnectorVoip {
         debug(request)
         this.ws.send(JSON.stringify(request))
       })
-      this.ws.on('close', () => {
+      this.ws.on('close', async () => {
         debug(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} closed.`)
       })
       this.ws.on('error', (err) => {
@@ -172,8 +172,17 @@ class BotiumConnectorVoip {
           reject(new Error('Cannot connect to VOIP Worker because of wrong API key'))
         }
 
+        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden') {
+          debug('error')
+          reject(new Error('Cannot connect to VOIP Worker because of wrong API key'))
+        }
+
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
           resolve()
+        }
+
+        if (parsedData && parsedData.type === 'error') {
+          reject(new Error(parsedData.message))
         }
 
         if (parsedData && parsedData.type === 'fullRecord') {
