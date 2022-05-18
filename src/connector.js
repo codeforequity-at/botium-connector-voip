@@ -258,20 +258,17 @@ class BotiumConnectorVoip {
         }
       }
       if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
-        msg.userInputs.forEach((userInput, index) => {
-          const request = JSON.stringify({
-            METHOD: 'sendAudio',
-            PESQ: userInput.args.filter(a => a.includes(';PESQ')).length > 0,
-            sessionId: this.sessionId,
-            b64_buffer: msg.media[index].buffer.toString('base64')
-          })
-          msg.attachments.push({
-            name: msg.media[index].mediaUri,
-            mimeType: msg.media[index].mimeType,
-            base64: msg.media[index].buffer.toString('base64')
-          })
-          this.ws.send(request)
+        const request = JSON.stringify({
+          METHOD: 'sendAudio',
+          sessionId: this.sessionId,
+          b64_buffer: msg.media[0].buffer.toString('base64')
         })
+        msg.attachments.push({
+          name: msg.media[0].mediaUri,
+          mimeType: msg.media[0].mimeType,
+          base64: msg.media[0].buffer.toString('base64')
+        })
+        this.ws.send(request)
       }
     }, 500)
   }
