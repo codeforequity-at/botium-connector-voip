@@ -192,6 +192,7 @@ class BotiumConnectorVoip {
             mimeType: 'audio/wav',
             base64: parsedData.fullRecord
           })
+          this.Stop()
         }
 
         if (parsedData && parsedData.data && parsedData.data.final) {
@@ -212,65 +213,69 @@ class BotiumConnectorVoip {
     if (!msg.attachments) {
       msg.attachments = []
     }
-    setTimeout(async () => {
-      if (msg && msg.buttons && msg.buttons.length > 0) {
-        const request = JSON.stringify({
-          METHOD: 'sendDtmf',
-          digits: msg.buttons[0].payload,
-          sessionId: this.sessionId
-        })
-        this.ws.send(request)
-      } else if (msg && msg.messageText) {
-        if (!this.axiosTtsParams) throw new Error('TTS not configured, only audio input supported')
-
-        const ttsRequest = {
-          ...this.axiosTtsParams,
-          params: {
-            ...(this.axiosTtsParams.params || {}),
-            text: msg.messageText
-          },
-          data: this._getBody(Capabilities.BSP_TTS_BODY),
-          responseType: 'arraybuffer'
-        }
-        msg.sourceData = ttsRequest
-
-        let ttsResponse = null
-        try {
-          ttsResponse = await axios(ttsRequest)
-        } catch (err) {
-          throw new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`)
-        }
-        if (Buffer.isBuffer(ttsResponse.data)) {
+    return new Promise((resolve, reject) => {
+      setTimeout(async () => {
+        if (msg && msg.buttons && msg.buttons.length > 0) {
           const request = JSON.stringify({
-            METHOD: 'sendAudio',
-            PESQ: false,
-            sessionId: this.sessionId,
-            b64_buffer: ttsResponse.data.toString('base64')
-          })
-          msg.attachments.push({
-            name: 'tts.wav',
-            mimeType: 'audio/wav',
-            base64: ttsResponse.data.toString('base64')
+            METHOD: 'sendDtmf',
+            digits: msg.buttons[0].payload,
+            sessionId: this.sessionId
           })
           this.ws.send(request)
-        } else {
-          throw new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse.data)}`)
+        } else if (msg && msg.messageText) {
+          if (!this.axiosTtsParams) reject(new Error('TTS not configured, only audio input supported'))
+          if (this.axiosTtsParams) {
+            const ttsRequest = {
+              ...this.axiosTtsParams,
+              params: {
+                ...(this.axiosTtsParams.params || {}),
+                text: msg.messageText
+              },
+              data: this._getBody(Capabilities.BSP_TTS_BODY),
+              responseType: 'arraybuffer'
+            }
+            msg.sourceData = ttsRequest
+
+            let ttsResponse = null
+            try {
+              ttsResponse = await axios(ttsRequest)
+            } catch (err) {
+              reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
+            }
+            if (Buffer.isBuffer(ttsResponse.data)) {
+              const request = JSON.stringify({
+                METHOD: 'sendAudio',
+                PESQ: false,
+                sessionId: this.sessionId,
+                b64_buffer: ttsResponse.data.toString('base64')
+              })
+              msg.attachments.push({
+                name: 'tts.wav',
+                mimeType: 'audio/wav',
+                base64: ttsResponse.data.toString('base64')
+              })
+              this.ws.send(request)
+            } else {
+              reject(new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse.data)}`))
+            }
+          }
         }
-      }
-      if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
-        const request = JSON.stringify({
-          METHOD: 'sendAudio',
-          sessionId: this.sessionId,
-          b64_buffer: msg.media[0].buffer.toString('base64')
-        })
-        msg.attachments.push({
-          name: msg.media[0].mediaUri,
-          mimeType: msg.media[0].mimeType,
-          base64: msg.media[0].buffer.toString('base64')
-        })
-        this.ws.send(request)
-      }
-    }, 500)
+        if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
+          const request = JSON.stringify({
+            METHOD: 'sendAudio',
+            sessionId: this.sessionId,
+            b64_buffer: msg.media[0].buffer.toString('base64')
+          })
+          msg.attachments.push({
+            name: msg.media[0].mediaUri,
+            mimeType: msg.media[0].mimeType,
+            base64: msg.media[0].buffer.toString('base64')
+          })
+          this.ws.send(request)
+        }
+        resolve()
+      }, 500)
+    })
   }
 
   async Stop () {
