@@ -14,6 +14,7 @@ const Capabilities = {
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER',
+  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: 'VOIP_STT_MESSAGE_HANDLING_PUNCTUATION',
   VOIP_TTS_URL: 'VOIP_TTS_URL',
   VOIP_TTS_PARAMS: 'VOIP_TTS_PARAMS',
   VOIP_TTS_METHOD: 'VOIP_TTS_METHOD',
@@ -47,7 +48,8 @@ const Defaults = {
   VOIP_TTS_TIMEOUT: 10000,
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 5000,
-  VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. '
+  VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
+  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?'
 }
 
 class BotiumConnectorVoip {
@@ -116,6 +118,25 @@ class BotiumConnectorVoip {
       botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER])
       botMsg.sourceData = botMsgs.map(m => m.sourceData)
       return botMsg
+    }
+
+    const expandBotMsgs = botMsgs => {
+      const splitSentences = s => s.match(new RegExp(`[^${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+[${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+`, 'g'))
+      const botMsgsFinal = []
+      for (const botMsg of botMsgs) {
+        const sentences = splitSentences(botMsg.messageText)
+        if (_.isNil(sentences)) {
+          botMsgsFinal.push(botMsg)
+        } else {
+          for (const sentence of sentences) {
+            botMsgsFinal.push({
+              messageText: sentence,
+              sourceData: botMsg.sourceData
+            })
+          }
+        }
+      }
+      return botMsgsFinal
     }
 
     return new Promise((resolve, reject) => {
@@ -230,6 +251,11 @@ class BotiumConnectorVoip {
           this.botMsgs.push(botMsg)
           if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
             this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
+            this.botMsgs = []
+          }
+          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
+            const botMsgsExpanded = expandBotMsgs(this.botMsgs)
+            botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
             this.botMsgs = []
           }
           if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
