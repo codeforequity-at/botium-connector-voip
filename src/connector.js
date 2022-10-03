@@ -11,6 +11,10 @@ const Capabilities = {
   VOIP_STT_BODY_STREAM: 'VOIP_STT_BODY_STREAM',
   VOIP_STT_HEADERS: 'VOIP_STT_HEADERS',
   VOIP_STT_TIMEOUT: 'VOIP_STT_TIMEOUT',
+  VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
+  VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT',
+  VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER',
+  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: 'VOIP_STT_MESSAGE_HANDLING_PUNCTUATION',
   VOIP_TTS_URL: 'VOIP_TTS_URL',
   VOIP_TTS_PARAMS: 'VOIP_TTS_PARAMS',
   VOIP_TTS_METHOD: 'VOIP_TTS_METHOD',
@@ -41,7 +45,11 @@ const Defaults = {
   VOIP_STT_METHOD: 'POST',
   VOIP_STT_TIMEOUT: 10000,
   VOIP_TTS_METHOD: 'GET',
-  VOIP_TTS_TIMEOUT: 10000
+  VOIP_TTS_TIMEOUT: 10000,
+  VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
+  VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 5000,
+  VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
+  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?'
 }
 
 class BotiumConnectorVoip {
@@ -49,10 +57,15 @@ class BotiumConnectorVoip {
     this.queueBotSays = queueBotSays
     this.caps = caps
     this.eventEmitter = eventEmitter
+    this.botMsgs = []
+    this.sentencesBuilding = 0
+    this.sentencesFinal = 0
+    this.sentenceBuilding = false
   }
 
   async Validate () {
     debug('Validate called')
+    debug(this.caps.VOIP_STT_MESSAGE_HANDLING)
 
     if (this.caps.VOIP_TTS_URL) {
       this.axiosTtsParams = {
@@ -96,6 +109,35 @@ class BotiumConnectorVoip {
 
     this.fullRecord = ''
     this.end = false
+
+    const sendBotMsg = (botMsg) => { setTimeout(() => this.queueBotSays(botMsg), 0) }
+
+    const buildBotMsg = botMsgs => {
+      if (botMsgs.length === 1) return botMsgs[0]
+      const botMsg = {}
+      botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER])
+      botMsg.sourceData = botMsgs.map(m => m.sourceData)
+      return botMsg
+    }
+
+    const expandBotMsgs = botMsgs => {
+      const splitSentences = s => s.match(new RegExp(`[^${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+[${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+`, 'g'))
+      const botMsgsFinal = []
+      for (const botMsg of botMsgs) {
+        const sentences = splitSentences(botMsg.messageText)
+        if (_.isNil(sentences)) {
+          botMsgsFinal.push(botMsg)
+        } else {
+          for (const sentence of sentences) {
+            botMsgsFinal.push({
+              messageText: sentence,
+              sourceData: botMsg.sourceData
+            })
+          }
+        }
+      }
+      return botMsgsFinal
+    }
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(this.caps[Capabilities.VOIP_WORKER_URL])
@@ -156,9 +198,11 @@ class BotiumConnectorVoip {
       })
       this.ws.on('message', async (data) => {
         const parsedData = JSON.parse(data)
-        const botMsgs = []
 
-        debug(parsedData)
+        const parsedDataLog = _.cloneDeep(parsedData)
+        parsedDataLog.fullRecord = '<full_record_buffer>'
+
+        debug(parsedDataLog)
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
           this.sessionId = parsedData.voipConfig.sessionId
@@ -195,12 +239,40 @@ class BotiumConnectorVoip {
           this.Stop()
         }
 
-        if (parsedData && parsedData.data && parsedData.data.final) {
-          const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
-          botMsgs.push(botMsg)
+        if (parsedData && parsedData.data && parsedData.data.final === false) {
+          if (!this.sentenceBuilding) {
+            this.sentenceBuilding = true
+            this.sentencesBuilding++
+          }
         }
 
-        botMsgs.forEach(botMsg => setTimeout(() => this.queueBotSays(botMsg), 0))
+        if (parsedData && parsedData.data && parsedData.data.final) {
+          const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
+          this.botMsgs.push(botMsg)
+          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
+            this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
+            this.botMsgs = []
+          }
+          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
+            const botMsgsExpanded = expandBotMsgs(this.botMsgs)
+            botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
+            this.botMsgs = []
+          }
+          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
+            this.sentenceBuilding = false
+            this.sentencesFinal++
+
+            clearTimeout(this.sendMessageTimeout)
+            this.sendMessageTimeout = setTimeout(() => {
+              if (this.sentenceBuilding === false && this.sentencesBuilding === this.sentencesFinal) {
+                sendBotMsg(buildBotMsg(this.botMsgs))
+                this.botMsgs = []
+                this.sentencesBuilding = 0
+                this.sentencesFinal = 0
+              }
+            }, this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+          }
+        }
       })
     })
   }
