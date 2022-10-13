@@ -184,7 +184,7 @@ class BotiumConnectorVoip {
             tts_body: this.caps[Capabilities.VOIP_TTS_BODY] || null
           }
         }
-        debug(request)
+        debug(JSON.stringify(request, null, 2))
         this.ws.send(JSON.stringify(request))
       })
       this.ws.on('close', async () => {
@@ -193,6 +193,7 @@ class BotiumConnectorVoip {
       this.ws.on('error', (err) => {
         debug(err)
         if (!this.wsOpened) {
+          this.end = true
           reject(new Error(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} error: ${err.message || err}`))
         }
       })
@@ -202,23 +203,22 @@ class BotiumConnectorVoip {
         const parsedDataLog = _.cloneDeep(parsedData)
         parsedDataLog.fullRecord = '<full_record_buffer>'
 
-        debug(parsedDataLog)
+        debug(JSON.stringify(parsedDataLog, null, 2))
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
           this.sessionId = parsedData.voipConfig.sessionId
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
-          reject(new Error('Cannot open a call: SIP Authorization failed'))
+          reject(new Error('Error: Cannot open a call: SIP Authorization failed'))
         }
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden') {
-          reject(new Error('Cannot connect to VOIP Worker because of wrong API key'))
+        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event !== 'onCallRegState') {
+          reject(new Error('Error: Cannot connect to VOIP Worker because of wrong API key'))
         }
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden') {
-          debug('error')
-          reject(new Error('Cannot connect to VOIP Worker because of wrong API key'))
+        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event === 'onCallRegState') {
+          reject(new Error('Error: Sip Registration failed'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
@@ -226,7 +226,7 @@ class BotiumConnectorVoip {
         }
 
         if (parsedData && parsedData.type === 'error') {
-          reject(new Error(parsedData.message))
+          reject(new Error(`Error: ${parsedData.message}`))
         }
 
         if (parsedData && parsedData.type === 'fullRecord') {
