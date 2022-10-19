@@ -9,6 +9,7 @@ const Capabilities = {
   VOIP_STT_PARAMS_STREAM: 'VOIP_STT_PARAMS_STREAM',
   VOIP_STT_METHOD_STREAM: 'VOIP_STT_METHOD_STREAM',
   VOIP_STT_BODY_STREAM: 'VOIP_STT_BODY_STREAM',
+  VOIP_STT_BODY: 'VOIP_STT_BODY',
   VOIP_STT_HEADERS: 'VOIP_STT_HEADERS',
   VOIP_STT_TIMEOUT: 'VOIP_STT_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
@@ -225,6 +226,18 @@ class BotiumConnectorVoip {
           resolve()
         }
 
+        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
+          const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
+          if (parsedData.connectDuration && parsedData.connectDuration > 0) {
+            this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+              type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
+              metricName: 'consumption.e2e.voip.stt.seconds',
+              credits: parsedData.connectDuration,
+              apiKey
+            })
+          }
+        }
+
         if (parsedData && parsedData.type === 'error') {
           reject(new Error(`Error: ${parsedData.message}`))
         }
@@ -303,7 +316,7 @@ class BotiumConnectorVoip {
                 ...(this.axiosTtsParams.params || {}),
                 text: msg.messageText
               },
-              data: this._getBody(Capabilities.BSP_TTS_BODY),
+              data: this._getBody(Capabilities.VOIP_TTS_BODY),
               responseType: 'arraybuffer'
             }
             msg.sourceData = ttsRequest
@@ -313,6 +326,15 @@ class BotiumConnectorVoip {
               ttsResponse = await axios(ttsRequest)
             } catch (err) {
               reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
+            }
+            if (msg && msg.messageText && msg.messageText.length > 0) {
+              const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
+              this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+                type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
+                metricName: 'consumption.e2e.voip.tts.characters',
+                credits: msg.messageText.length,
+                apiKey
+              })
             }
             if (Buffer.isBuffer(ttsResponse.data)) {
               const request = JSON.stringify({
@@ -422,6 +444,15 @@ class BotiumConnectorVoip {
     } else {
       return err.message
     }
+  }
+
+  _extractApiKey (body) {
+    return _.get(body, 'polly.credentials.accessKeyId') ||
+      _.get(body, 'google.credentials.client_email') ||
+      _.get(body, 'ibm.credentials.apikey') ||
+      _.get(body, 'awstranscribe.credentials.accessKeyId') ||
+      _.get(body, 'azure.credentials.subscriptionKey') ||
+      null
   }
 }
 
