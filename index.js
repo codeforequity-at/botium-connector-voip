@@ -7,7 +7,8 @@ module.exports = {
     name: 'Voice over IP',
     provider: 'Botium',
     features: {
-      audioInput: true
+      audioInput: true,
+      e2eTesting: true
     },
     capabilities: [
       {
