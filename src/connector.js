@@ -300,6 +300,7 @@ class BotiumConnectorVoip {
     }
     return new Promise((resolve, reject) => {
       setTimeout(async () => {
+        let duration = 0
         if (msg && msg.buttons && msg.buttons.length > 0) {
           const request = JSON.stringify({
             METHOD: 'sendDtmf',
@@ -337,6 +338,7 @@ class BotiumConnectorVoip {
               })
             }
             if (Buffer.isBuffer(ttsResponse.data)) {
+              duration = ttsResponse.headers['content-duration']
               const request = JSON.stringify({
                 METHOD: 'sendAudio',
                 PESQ: false,
@@ -355,6 +357,20 @@ class BotiumConnectorVoip {
           }
         }
         if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
+          const { data } = await axios({
+            method: 'post',
+            data: msg.media[0].buffer,
+            headers: {
+              ...this._getHeaders(Capabilities.VOIP_TTS_HEADERS),
+              'Content-Type': 'audio/wave'
+            },
+            url: this._getAxiosUrl(this.caps.VOIP_TTS_URL, '/api/audio/info'),
+            maxContentLength: Infinity,
+            maxBodyLength: Infinity
+          })
+          if (data && data.duration) {
+            duration = parseInt(data.duration)
+          }
           const request = JSON.stringify({
             METHOD: 'sendAudio',
             sessionId: this.sessionId,
@@ -367,8 +383,8 @@ class BotiumConnectorVoip {
           })
           this.ws.send(request)
         }
-        resolve()
-      }, 500)
+        setTimeout(resolve, duration * 1000)
+      }, 0)
     })
   }
 
