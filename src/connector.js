@@ -240,6 +240,8 @@ class BotiumConnectorVoip {
 
         if (parsedData && parsedData.type === 'error') {
           reject(new Error(`Error: ${parsedData.message}`))
+          this.end = true
+          this.Stop()
         }
 
         if (parsedData && parsedData.type === 'fullRecord') {
