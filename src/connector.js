@@ -402,7 +402,9 @@ class BotiumConnectorVoip {
       METHOD: 'stopCall',
       sessionId: this.sessionId
     })
-    this.ws.send(request)
+    if (this.ws) {
+      this.ws.send(request)
+    }
     await new Promise(resolve => {
       setTimeout(resolve, 50000)
       setInterval(() => {
