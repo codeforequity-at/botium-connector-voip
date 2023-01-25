@@ -211,14 +211,20 @@ class BotiumConnectorVoip {
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
+          this.end = true
+          await this.Stop()
           reject(new Error('Error: Cannot open a call: SIP Authorization failed'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event !== 'onCallRegState') {
+          this.end = true
+          await this.Stop()
           reject(new Error('Error: Cannot connect to VOIP Worker because of wrong API key'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event === 'onCallRegState') {
+          this.end = true
+          await this.Stop()
           reject(new Error('Error: Sip Registration failed'))
         }
 
@@ -239,9 +245,9 @@ class BotiumConnectorVoip {
         }
 
         if (parsedData && parsedData.type === 'error') {
-          reject(new Error(`Error: ${parsedData.message}`))
           this.end = true
-          this.Stop()
+          await this.Stop()
+          reject(new Error(`Error: ${parsedData.message}`))
         }
 
         if (parsedData && parsedData.type === 'fullRecord') {
