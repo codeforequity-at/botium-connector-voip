@@ -190,6 +190,8 @@ class BotiumConnectorVoip {
       })
       this.ws.on('close', async () => {
         debug(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} closed.`)
+        this.end = true
+        await this.Stop()
       })
       this.ws.on('error', (err) => {
         debug(err)
@@ -398,28 +400,31 @@ class BotiumConnectorVoip {
 
   async Stop () {
     debug('Stop called')
-    const request = JSON.stringify({
-      METHOD: 'stopCall',
-      sessionId: this.sessionId
-    })
-    if (this.ws) {
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+      const request = JSON.stringify({
+        METHOD: 'stopCall',
+        sessionId: this.sessionId
+      })
       this.ws.send(request)
+      await new Promise(resolve => {
+        setTimeout(resolve, 50000)
+        setInterval(() => {
+          if (this.end) {
+            this.wsOpened = false
+            this.ws = null
+            this.view = {}
+            resolve()
+          }
+        }, 1000)
+      })
+      if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+        this.ws.close()
+      }
+    } else {
+      this.wsOpened = false
+      this.ws = null
+      this.view = {}
     }
-    await new Promise(resolve => {
-      setTimeout(resolve, 50000)
-      setInterval(() => {
-        if (this.end) {
-          resolve()
-        }
-      }, 1000)
-    })
-
-    if (this.ws) {
-      this.ws.close()
-    }
-    this.wsOpened = false
-    this.ws = null
-    this.view = {}
   }
 
   _getParams (capParams) {
