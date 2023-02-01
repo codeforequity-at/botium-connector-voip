@@ -2,6 +2,7 @@ const { v4: uuidv4 } = require('uuid')
 const WebSocket = require('ws')
 const _ = require('lodash')
 const axios = require('axios')
+const crypto = require('crypto')
 const debug = require('debug')('botium-connector-voip')
 
 const Capabilities = {
@@ -24,6 +25,7 @@ const Capabilities = {
   VOIP_TTS_TIMEOUT: 'VOIP_TTS_TIMEOUT',
   VOIP_WORKER_URL: 'VOIP_WORKER_URL',
   VOIP_WORKER_APIKEY: 'VOIP_WORKER_APIKEY',
+  VOIP_WORKER_USE_AUDIO_CACHE: 'VOIP_WORKER_USE_AUDIO_CACHE',
   VOIP_SIP_POOL_CALLER_ENABLE: 'VOIP_SIP_POOL_CALLER_ENABLE',
   VOIP_SIP_CALLER_REGISTRAR_URI: 'VOIP_SIP_CALLER_REGISTRAR_URI',
   VOIP_SIP_CALLER_ADDRESS: 'VOIP_SIP_CALLER_ADDRESS',
@@ -50,7 +52,8 @@ const Defaults = {
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 5000,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
-  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?'
+  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
+  VOIP_WORKER_USE_AUDIO_CACHE: true
 }
 
 class BotiumConnectorVoip {
@@ -246,6 +249,10 @@ class BotiumConnectorVoip {
           }
         }
 
+        if (parsedData && parsedData.type === 'messaging' && parsedData.status === 'sendingFromCache') {
+          this.sentFromCache = parsedData.sentFromCache
+        }
+
         if (parsedData && parsedData.type === 'error') {
           this.end = true
           await this.Stop()
@@ -347,22 +354,34 @@ class BotiumConnectorVoip {
                 apiKey
               })
             }
-            if (Buffer.isBuffer(ttsResponse.data)) {
+            if (ttsResponse && Buffer.isBuffer(ttsResponse.data)) {
               duration = ttsResponse.headers['content-duration']
-              const request = JSON.stringify({
-                METHOD: 'sendAudio',
-                PESQ: false,
-                sessionId: this.sessionId,
-                b64_buffer: ttsResponse.data.toString('base64')
-              })
-              msg.attachments.push({
-                name: 'tts.wav',
-                mimeType: 'audio/wav',
-                base64: ttsResponse.data.toString('base64')
-              })
-              this.ws.send(request)
+              let hash
+              if (this.caps.VOIP_WORKER_USE_AUDIO_CACHE) {
+                hash = await this._sendAudioFromCache(ttsResponse.data, {
+                  METHOD: 'sendAudioFromCache',
+                  PESQ: false,
+                  sessionId: this.sessionId
+                })
+              }
+              if (!this.sentFromCache || !this.caps.VOIP_WORKER_USE_AUDIO_CACHE) {
+                const request = JSON.stringify({
+                  METHOD: 'sendAudio',
+                  PESQ: false,
+                  sessionId: this.sessionId,
+                  b64_buffer: ttsResponse.data.toString('base64'),
+                  contentHash: hash,
+                  cache: !!this.caps.VOIP_WORKER_USE_AUDIO_CACHE
+                })
+                msg.attachments.push({
+                  name: 'tts.wav',
+                  mimeType: 'audio/wav',
+                  base64: ttsResponse.data.toString('base64')
+                })
+                this.ws.send(request)
+              }
             } else {
-              reject(new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse.data)}`))
+              reject(new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse ? ttsResponse.data : undefined)}`))
             }
           }
         }
@@ -381,17 +400,28 @@ class BotiumConnectorVoip {
           if (data && data.duration) {
             duration = parseInt(data.duration)
           }
-          const request = JSON.stringify({
-            METHOD: 'sendAudio',
-            sessionId: this.sessionId,
-            b64_buffer: msg.media[0].buffer.toString('base64')
-          })
-          msg.attachments.push({
-            name: msg.media[0].mediaUri,
-            mimeType: msg.media[0].mimeType,
-            base64: msg.media[0].buffer.toString('base64')
-          })
-          this.ws.send(request)
+          let hash
+          if (this.caps.VOIP_WORKER_USE_AUDIO_CACHE) {
+            hash = await this._sendAudioFromCache(msg.media[0].buffer, {
+              METHOD: 'sendAudioFromCache',
+              sessionId: this.sessionId
+            })
+          }
+          if (!this.sentFromCache || !this.caps.VOIP_WORKER_USE_AUDIO_CACHE) {
+            const request = JSON.stringify({
+              METHOD: 'sendAudio',
+              sessionId: this.sessionId,
+              b64_buffer: msg.media[0].buffer.toString('base64'),
+              contentHash: hash,
+              cache: !!this.caps.VOIP_WORKER_USE_AUDIO_CACHE
+            })
+            msg.attachments.push({
+              name: msg.media[0].mediaUri,
+              mimeType: msg.media[0].mimeType,
+              base64: msg.media[0].buffer.toString('base64')
+            })
+            this.ws.send(request)
+          }
         }
         setTimeout(resolve, duration * 1000)
       }, 0)
@@ -425,6 +455,23 @@ class BotiumConnectorVoip {
       this.ws = null
       this.view = {}
     }
+  }
+
+  async _sendAudioFromCache (data, requestObject) {
+    this.sentFromCache = undefined
+    const hashSum = crypto.createHash('sha256')
+    hashSum.update(data)
+    const hash = hashSum.digest('hex')
+    requestObject.contentHash = hash
+    const request = JSON.stringify(requestObject)
+    this.ws.send(request)
+
+    const now = Date.now()
+    const timeout = 30 * 1000
+    while (this.sentFromCache === undefined && timeout > Date.now() - now) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+    }
+    return hash
   }
 
   _getParams (capParams) {
