@@ -108,6 +108,8 @@ class BotiumConnectorVoip {
       }
     }
 
+    this.stopCalled = false
+
     this.fullRecord = ''
     this.end = false
 
@@ -189,15 +191,13 @@ class BotiumConnectorVoip {
         this.ws.send(JSON.stringify(request))
       })
       this.ws.on('close', async () => {
-        debug(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} closed.`)
-        this.end = true
-        await this.Stop()
+        debug(`${this.sessionId} - Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} closed.`)
       })
       this.ws.on('error', (err) => {
         debug(err)
         if (!this.wsOpened) {
           this.end = true
-          reject(new Error(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} error: ${err.message || err}`))
+          reject(new Error(`${this.sessionId} - Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} error: ${err.message || err}`))
         }
       })
       this.ws.on('message', async (data) => {
@@ -213,20 +213,14 @@ class BotiumConnectorVoip {
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
-          this.end = true
-          await this.Stop()
           reject(new Error('Error: Cannot open a call: SIP Authorization failed'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event !== 'onCallRegState') {
-          this.end = true
-          await this.Stop()
           reject(new Error('Error: Cannot connect to VOIP Worker because of wrong API key'))
         }
 
         if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event === 'onCallRegState') {
-          this.end = true
-          await this.Stop()
           reject(new Error('Error: Sip Registration failed'))
         }
 
@@ -248,7 +242,7 @@ class BotiumConnectorVoip {
 
         if (parsedData && parsedData.type === 'error') {
           this.end = true
-          await this.Stop()
+          this.Stop()
           reject(new Error(`Error: ${parsedData.message}`))
         }
 
@@ -367,6 +361,17 @@ class BotiumConnectorVoip {
           }
         }
         if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
+          const request = JSON.stringify({
+            METHOD: 'sendAudio',
+            sessionId: this.sessionId,
+            b64_buffer: msg.media[0].buffer.toString('base64')
+          })
+          this.ws.send(request)
+          msg.attachments.push({
+            name: msg.media[0].mediaUri,
+            mimeType: msg.media[0].mimeType,
+            base64: msg.media[0].buffer.toString('base64')
+          })
           const { data } = await axios({
             method: 'post',
             data: msg.media[0].buffer,
@@ -380,18 +385,9 @@ class BotiumConnectorVoip {
           })
           if (data && data.duration) {
             duration = parseInt(data.duration)
+          } else {
+            reject(new Error('Getting audio duration from Speech Api failed'))
           }
-          const request = JSON.stringify({
-            METHOD: 'sendAudio',
-            sessionId: this.sessionId,
-            b64_buffer: msg.media[0].buffer.toString('base64')
-          })
-          msg.attachments.push({
-            name: msg.media[0].mediaUri,
-            mimeType: msg.media[0].mimeType,
-            base64: msg.media[0].buffer.toString('base64')
-          })
-          this.ws.send(request)
         }
         setTimeout(resolve, duration * 1000)
       }, 0)
@@ -399,31 +395,34 @@ class BotiumConnectorVoip {
   }
 
   async Stop () {
-    debug('Stop called')
-    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-      const request = JSON.stringify({
-        METHOD: 'stopCall',
-        sessionId: this.sessionId
-      })
-      this.ws.send(request)
-      await new Promise(resolve => {
-        setTimeout(resolve, 50000)
-        setInterval(() => {
-          if (this.end) {
-            this.wsOpened = false
-            this.ws = null
-            this.view = {}
-            resolve()
-          }
-        }, 1000)
-      })
+    if (!this.stopCalled) {
+      this.stopCalled = true
+      debug(`${this.sessionId} - Stop called`)
       if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-        this.ws.close()
+        const request = JSON.stringify({
+          METHOD: 'stopCall',
+          sessionId: this.sessionId
+        })
+        this.ws.send(request)
+        await new Promise(resolve => {
+          setTimeout(resolve, 50000)
+          setInterval(() => {
+            if (this.end) {
+              this.wsOpened = false
+              this.ws = null
+              this.view = {}
+              resolve()
+            }
+          }, 1000)
+        })
+        /* if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+          this.ws.close()
+        } */
+      } else {
+        this.wsOpened = false
+        this.ws = null
+        this.view = {}
       }
-    } else {
-      this.wsOpened = false
-      this.ws = null
-      this.view = {}
     }
   }
 
