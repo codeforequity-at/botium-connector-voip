@@ -40,7 +40,9 @@ const Capabilities = {
   VOIP_ICE_TURN_SERVER: 'VOIP_ICE_TURN_SERVER',
   VOIP_ICE_TURN_USER: 'VOIP_ICE_TURN_USER',
   VOIP_ICE_TURN_PASSWORD: 'VOIP_ICE_TURN_PASSWORD',
-  VOIP_ICE_TURN_PROTOCOL: 'VOIP_ICE_TURN_PROTOCOL'
+  VOIP_ICE_TURN_PROTOCOL: 'VOIP_ICE_TURN_PROTOCOL',
+  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 'VOIP_WEBSOCKET_CONNECT_MAXRETRIES',
+  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 'VOIP_WEBSOCKET_CONNECT_TIMEOUT'
 }
 
 const Defaults = {
@@ -51,7 +53,9 @@ const Defaults = {
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 5000,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
-  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?'
+  VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
+  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 500,
+  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20
 }
 
 class BotiumConnectorVoip {
@@ -151,28 +155,37 @@ class BotiumConnectorVoip {
       url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
     })
 
-    await new Promise(resolve => {
-      setTimeout(resolve, 2000)
-    })
-
     return new Promise((resolve, reject) => {
       if (data.status === 'error') {
         reject(new Error(`Error connecting to VOIP Worker: ${data.message}`))
       }
-      this.ws = new WebSocket(this.caps[Capabilities.VOIP_WORKER_URL].replace('8765', data.port))
-
-      if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
-        if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
-          this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
-        } else {
-          this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = this.caps[Capabilities.VOIP_ICE_STUN_SERVERS].split(',')
-        }
+      const wsEndpoint = this.caps[Capabilities.VOIP_WORKER_URL].replace('8765', data.port)
+      const connect = (retryIndex) => {
+        retryIndex = retryIndex || 0
+        return new Promise((resolve, reject) => {
+          this.ws = new WebSocket(wsEndpoint)
+          this.ws.on('open', () => {
+            resolve()
+          })
+          this.ws.on('error', () => {
+            if (retryIndex === this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]) {
+              reject(new Error(`Websocket connection failed to ${wsEndpoint}`))
+            }
+            setTimeout(() => connect(retryIndex + 1).then(resolve).catch(reject), this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_TIMEOUT])
+          })
+        })
       }
+      connect().then(() => {
+        if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
+          if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
+            this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
+          } else {
+            this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = this.caps[Capabilities.VOIP_ICE_STUN_SERVERS].split(',')
+          }
+        }
 
-      this.wsOpened = false
-      this.ws.on('open', () => {
         this.wsOpened = true
-        debug(`Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_ENDPOINT]} opened.`)
+        debug(`Websocket connection to ${wsEndpoint} opened.`)
         const request = {
           METHOD: 'initCall',
           SIP_CALLER_AUTO: this.caps[Capabilities.VOIP_SIP_POOL_CALLER_ENABLE],
@@ -204,103 +217,106 @@ class BotiumConnectorVoip {
         }
         debug(JSON.stringify(request, null, 2))
         this.ws.send(JSON.stringify(request))
-      })
-      this.ws.on('close', async () => {
-        debug(`${this.sessionId} - Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} closed.`)
-      })
-      this.ws.on('error', (err) => {
-        debug(err)
-        if (!this.wsOpened) {
-          this.end = true
-          reject(new Error(`${this.sessionId} - Websocket connection to ${this.caps[Capabilities.VOIP_WORKER_URL]} error: ${err.message || err}`))
-        }
-      })
-      this.ws.on('message', async (data) => {
-        const parsedData = JSON.parse(data)
 
-        const parsedDataLog = _.cloneDeep(parsedData)
-        parsedDataLog.fullRecord = '<full_record_buffer>'
+        this.ws.on('close', async () => {
+          debug(`${this.sessionId} - Websocket connection to ${wsEndpoint} closed.`)
+        })
+        this.ws.on('error', (err) => {
+          debug(err)
+          if (!this.wsOpened) {
+            this.end = true
+            reject(new Error(`${this.sessionId} - Websocket connection to ${wsEndpoint} error: ${err.message || err}`))
+          }
+        })
+        this.ws.on('message', async (data) => {
+          const parsedData = JSON.parse(data)
 
-        debug(JSON.stringify(parsedDataLog, null, 2))
+          const parsedDataLog = _.cloneDeep(parsedData)
+          parsedDataLog.fullRecord = '<full_record_buffer>'
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
-          this.sessionId = parsedData.voipConfig.sessionId
-        }
+          debug(JSON.stringify(parsedDataLog, null, 2))
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
-          reject(new Error('Error: Cannot open a call: SIP Authorization failed'))
-        }
+          if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
+            this.sessionId = parsedData.voipConfig.sessionId
+          }
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event === 'onCallRegState') {
-          reject(new Error('Error: Sip Registration failed'))
-        }
+          if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
+            reject(new Error('Error: Cannot open a call: SIP Authorization failed'))
+          }
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
-          resolve()
-        }
+          if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event === 'onCallRegState') {
+            reject(new Error('Error: Sip Registration failed'))
+          }
 
-        if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
-          const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
-          if (parsedData.connectDuration && parsedData.connectDuration > 0) {
-            this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
-              type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
-              metricName: 'consumption.e2e.voip.stt.seconds',
-              credits: parsedData.connectDuration,
-              apiKey
+          if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
+            resolve()
+          }
+
+          if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
+            const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
+            if (parsedData.connectDuration && parsedData.connectDuration > 0) {
+              this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+                type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
+                metricName: 'consumption.e2e.voip.stt.seconds',
+                credits: parsedData.connectDuration,
+                apiKey
+              })
+            }
+          }
+
+          if (parsedData && parsedData.type === 'error') {
+            this.end = true
+            this.Stop()
+            reject(new Error(`Error: ${parsedData.message}`))
+          }
+
+          if (parsedData && parsedData.type === 'fullRecord') {
+            this.end = true
+            this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
+              name: 'full_record.wav',
+              mimeType: 'audio/wav',
+              base64: parsedData.fullRecord
             })
+            this.Stop()
           }
-        }
 
-        if (parsedData && parsedData.type === 'error') {
-          this.end = true
-          this.Stop()
-          reject(new Error(`Error: ${parsedData.message}`))
-        }
-
-        if (parsedData && parsedData.type === 'fullRecord') {
-          this.end = true
-          this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
-            name: 'full_record.wav',
-            mimeType: 'audio/wav',
-            base64: parsedData.fullRecord
-          })
-          this.Stop()
-        }
-
-        if (parsedData && parsedData.data && parsedData.data.final === false) {
-          if (!this.sentenceBuilding) {
-            this.sentenceBuilding = true
-            this.sentencesBuilding++
+          if (parsedData && parsedData.data && parsedData.data.final === false) {
+            if (!this.sentenceBuilding) {
+              this.sentenceBuilding = true
+              this.sentencesBuilding++
+            }
           }
-        }
 
-        if (parsedData && parsedData.data && parsedData.data.final) {
-          const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
-          this.botMsgs.push(botMsg)
-          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
-            this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
-            this.botMsgs = []
-          }
-          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
-            const botMsgsExpanded = expandBotMsgs(this.botMsgs)
-            botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
-            this.botMsgs = []
-          }
-          if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
-            this.sentenceBuilding = false
-            this.sentencesFinal++
+          if (parsedData && parsedData.data && parsedData.data.final) {
+            const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
+            this.botMsgs.push(botMsg)
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
+              this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
+              this.botMsgs = []
+            }
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
+              const botMsgsExpanded = expandBotMsgs(this.botMsgs)
+              botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
+              this.botMsgs = []
+            }
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
+              this.sentenceBuilding = false
+              this.sentencesFinal++
 
-            clearTimeout(this.sendMessageTimeout)
-            this.sendMessageTimeout = setTimeout(() => {
-              if (this.sentenceBuilding === false && this.sentencesBuilding === this.sentencesFinal) {
-                sendBotMsg(buildBotMsg(this.botMsgs))
-                this.botMsgs = []
-                this.sentencesBuilding = 0
-                this.sentencesFinal = 0
-              }
-            }, this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+              clearTimeout(this.sendMessageTimeout)
+              this.sendMessageTimeout = setTimeout(() => {
+                if (this.sentenceBuilding === false && this.sentencesBuilding === this.sentencesFinal) {
+                  sendBotMsg(buildBotMsg(this.botMsgs))
+                  this.botMsgs = []
+                  this.sentencesBuilding = 0
+                  this.sentencesFinal = 0
+                }
+              }, this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+            }
           }
-        }
+        })
+      }).catch(err => {
+        reject(err)
       })
     })
   }
