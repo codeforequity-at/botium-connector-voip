@@ -147,7 +147,7 @@ class BotiumConnectorVoip {
       return botMsgsFinal
     }
 
-    const { data } = await axios({
+    const { data, headers } = await axios({
       method: 'post',
       data: {
         API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
@@ -163,7 +163,11 @@ class BotiumConnectorVoip {
       const connect = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
-          this.ws = new WebSocket(wsEndpoint)
+          this.ws = new WebSocket(wsEndpoint, null, {
+            headers: {
+              Cookie: headers['set-cookie'] || null
+            }
+          })
           this.ws.on('open', () => {
             resolve()
           })
