@@ -163,11 +163,15 @@ class BotiumConnectorVoip {
       const connect = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
-          this.ws = new WebSocket(wsEndpoint, null, {
-            headers: {
-              Cookie: headers['set-cookie'] || null
-            }
-          })
+          if (headers.keys().includes('set-cookie')) {
+            this.ws = new WebSocket(wsEndpoint, {
+              headers: {
+                Cookie: headers['set-cookie']
+              }
+            })
+          } else {
+            this.ws = new WebSocket(wsEndpoint)
+          }
           this.ws.on('open', () => {
             resolve()
           })
