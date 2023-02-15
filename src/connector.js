@@ -159,11 +159,11 @@ class BotiumConnectorVoip {
       if (data.status === 'error') {
         reject(new Error(`Error connecting to VOIP Worker: ${data.message}`))
       }
-      const wsEndpoint = this.caps[Capabilities.VOIP_WORKER_URL].replace('8765', data.port)
+      const wsEndpoint = `${this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
       const connect = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
-          if (headers.keys().includes('set-cookie')) {
+          if ('set-cookie' in headers) {
             this.ws = new WebSocket(wsEndpoint, {
               headers: {
                 Cookie: headers['set-cookie']
