@@ -147,19 +147,23 @@ class BotiumConnectorVoip {
       return botMsgsFinal
     }
 
-    const { data, headers } = await axios({
-      method: 'post',
-      data: {
-        API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
-      },
-      url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
-    })
+    let data = null
+    let headers = null
+    try {
+      const res = await axios({
+        method: 'post',
+        data: {
+          API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
+        },
+        url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
+      })
+      data = res.data
+      headers = res.headers
+    } catch (err) {
+      return Promise.reject(new Error(`Error connecting to VOIP Worker: ${err.response.data.message}`))
+    }
 
     return new Promise((resolve, reject) => {
-      if (data.status === 'error') {
-        reject(new Error(`Error connecting to VOIP Worker: ${data.message}`))
-        return
-      }
       const wsEndpoint = `${this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
       const connect = (retryIndex) => {
         retryIndex = retryIndex || 0
