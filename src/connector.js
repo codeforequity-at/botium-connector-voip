@@ -54,7 +54,7 @@ const Defaults = {
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 5000,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
-  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 1000,
+  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 4000,
   VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20
 }
 
@@ -158,8 +158,9 @@ class BotiumConnectorVoip {
     return new Promise((resolve, reject) => {
       if (data.status === 'error') {
         reject(new Error(`Error connecting to VOIP Worker: ${data.message}`))
+        return
       }
-      const wsEndpoint = `${this.caps[Capabilities.VOIP_WORKER_URL]}`.replace('8765', data.port)
+      const wsEndpoint = `${this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
       const connect = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
@@ -224,7 +225,6 @@ class BotiumConnectorVoip {
           }
         }
 
-        if (this.ws.readyState !== WebSocket.OPEN) reject(new Error('Connectionlost'))
         debug(JSON.stringify(request, null, 2))
         this.ws.send(JSON.stringify(request))
 
