@@ -328,7 +328,7 @@ class BotiumConnectorVoip {
           }
         })
       }).catch(err => {
-        reject(new Error('aa' + err))
+        reject(new Error('Error: ' + err))
       })
     })
   }
