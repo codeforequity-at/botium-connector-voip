@@ -117,6 +117,7 @@ class BotiumConnectorVoip {
 
     this.fullRecord = ''
     this.end = false
+    this.connected = false
 
     const sendBotMsg = (botMsg) => { setTimeout(() => this.queueBotSays(botMsg), 0) }
 
@@ -260,7 +261,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
-            resolve()
+            this.connected = true
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
@@ -277,7 +278,6 @@ class BotiumConnectorVoip {
 
           if (parsedData && parsedData.type === 'error') {
             this.end = true
-            this.Stop()
             reject(new Error(`Error: ${parsedData.message}`))
           }
 
@@ -290,6 +290,9 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
+            if (this.connected) {
+              resolve()
+            }
             if (!this.sentenceBuilding) {
               this.sentenceBuilding = true
               this.sentencesBuilding++
@@ -431,34 +434,28 @@ class BotiumConnectorVoip {
   }
 
   async Stop () {
-    if (!this.stopCalled) {
-      this.stopCalled = true
-      debug(`${this.sessionId} - Stop called`)
-      if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-        const request = JSON.stringify({
-          METHOD: 'stopCall',
-          sessionId: this.sessionId
-        })
-        this.ws.send(request)
-        await new Promise(resolve => {
-          setTimeout(resolve, 50000)
-          setInterval(() => {
-            if (this.end) {
-              this.wsOpened = false
-              this.ws = null
-              this.view = {}
-              resolve()
-            }
-          }, 1000)
-        })
-        /* if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
-          this.ws.close()
-        } */
-      } else {
-        this.wsOpened = false
-        this.ws = null
-        this.view = {}
-      }
+    debug(`${this.sessionId} - Stop called`)
+    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+      const request = JSON.stringify({
+        METHOD: 'stopCall',
+        sessionId: this.sessionId
+      })
+      this.ws.send(request)
+      await new Promise(resolve => {
+        setTimeout(resolve, 50000)
+        setInterval(() => {
+          if (this.end) {
+            this.wsOpened = false
+            this.ws = null
+            this.view = {}
+            resolve()
+          }
+        }, 1000)
+      })
+    } else {
+      this.wsOpened = false
+      this.ws = null
+      this.view = {}
     }
   }
 
