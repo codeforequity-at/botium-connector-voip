@@ -161,7 +161,7 @@ class BotiumConnectorVoip {
       data = res.data
       headers = res.headers
     } catch (err) {
-      return Promise.reject(new Error(`Error connecting to VOIP Worker: ${err.response.data.message}`))
+      return Promise.reject(new Error(`Connecting to VOIP Worker failed: ${err.response.data.message || 'Not reachable'}`))
     }
 
     return new Promise((resolve, reject) => {
