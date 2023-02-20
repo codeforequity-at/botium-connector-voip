@@ -197,6 +197,8 @@ class BotiumConnectorVoip {
           }
         }
 
+        const randomBool = Math.random() < 0.5
+
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
         const request = {
@@ -282,13 +284,11 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'fullRecord') {
-            this.end = true
             this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
               name: 'full_record.wav',
               mimeType: 'audio/wav',
               base64: parsedData.fullRecord
             })
-            this.Stop()
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
@@ -298,7 +298,7 @@ class BotiumConnectorVoip {
             }
           }
 
-          if (parsedData && parsedData.data && parsedData.data.final) {
+          if (randomBool && parsedData && parsedData.data && parsedData.data.final) {
             const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
             this.botMsgs.push(botMsg)
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
