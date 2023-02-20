@@ -197,8 +197,6 @@ class BotiumConnectorVoip {
           }
         }
 
-        const randomBool = Math.random() < 0.5
-
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
         const request = {
@@ -298,7 +296,7 @@ class BotiumConnectorVoip {
             }
           }
 
-          if (randomBool && parsedData && parsedData.data && parsedData.data.final) {
+          if (parsedData && parsedData.data && parsedData.data.final) {
             const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
             this.botMsgs.push(botMsg)
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
