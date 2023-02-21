@@ -442,7 +442,7 @@ class BotiumConnectorVoip {
       })
       this.ws.send(request)
       await new Promise(resolve => {
-        setTimeout(resolve, 50000)
+        setTimeout(resolve, 10000)
         setInterval(() => {
           if (this.end) {
             this.wsOpened = false
