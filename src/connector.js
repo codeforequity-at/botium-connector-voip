@@ -126,9 +126,11 @@ class BotiumConnectorVoip {
       botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER])
       botMsg.sourceData = botMsgs.map(m => m.sourceData)
       if (_.isNil(joinLastPrevMsg)) {
-        botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start.toFixed(2)
+        botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start
+        botMsg.sourceData[0].voiceDuration = botMsgs[botMsgs.length - 1].sourceData.data.end - botMsgs[0].sourceData.data.start
       } else {
         botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start - joinLastPrevMsg.sourceData.data.end
+        botMsg.sourceData[0].voiceDuration = botMsgs[botMsgs.length - 1].sourceData.data.end - botMsgs[0].sourceData.data.start
       }
       return botMsg
     }
@@ -321,11 +323,13 @@ class BotiumConnectorVoip {
               if (this.firstMsg) {
                 const sourceData = parsedData
                 sourceData.silenceDuration = parsedData.data.start
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
                 this.firstMsg = false
               } else {
                 const sourceData = parsedData
                 sourceData.silenceDuration = parsedData.data.start - this.prevData.data.end
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
               }
               this.prevData = parsedData
@@ -338,11 +342,13 @@ class BotiumConnectorVoip {
               if (this.firstMsg) {
                 const sourceData = parsedData
                 sourceData.silenceDuration = parsedData.data.start
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
                 this.firstMsg = false
               } else {
                 const sourceData = parsedData
                 sourceData.silenceDuration = parsedData.data.start - this.prevData.data.end
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
               }
               this.prevData = parsedData
