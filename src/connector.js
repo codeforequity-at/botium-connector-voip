@@ -42,7 +42,11 @@ const Capabilities = {
   VOIP_ICE_TURN_PASSWORD: 'VOIP_ICE_TURN_PASSWORD',
   VOIP_ICE_TURN_PROTOCOL: 'VOIP_ICE_TURN_PROTOCOL',
   VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 'VOIP_WEBSOCKET_CONNECT_MAXRETRIES',
-  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 'VOIP_WEBSOCKET_CONNECT_TIMEOUT'
+  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 'VOIP_WEBSOCKET_CONNECT_TIMEOUT',
+  VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_ENABLE',
+  VOIP_SILENCE_DURATION_TIMEOUT: 'VOIP_SILENCE_DURATION_TIMEOUT',
+  VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE',
+  VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START'
 }
 
 const Defaults = {
@@ -51,11 +55,15 @@ const Defaults = {
   VOIP_TTS_METHOD: 'GET',
   VOIP_TTS_TIMEOUT: 10000,
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
-  VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 2500,
+  VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 500,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
   VOIP_WEBSOCKET_CONNECT_TIMEOUT: 4000,
-  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20
+  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20,
+  VOIP_SILENCE_DURATION_TIMEOUT: 2500,
+  VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: false,
+  VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
+  VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false
 }
 
 class BotiumConnectorVoip {
@@ -230,6 +238,7 @@ class BotiumConnectorVoip {
           ICE_TURN_USERNAME: this.caps[Capabilities.VOIP_ICE_TURN_USER],
           ICE_TURN_PASSWORD: this.caps[Capabilities.VOIP_ICE_TURN_PASSWORD],
           ICE_TURN_PROTOCOL: this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
+          MIN_SILENCE_DURATION: this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_ENABLE] ? this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] : null,
           STT_CONFIG: {
             stt_url: this.caps[Capabilities.VOIP_STT_URL_STREAM],
             stt_params: this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
@@ -273,13 +282,13 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
-            this.connected = true
+            resolve()
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
             const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
             if (parsedData.connectDuration && parsedData.connectDuration > 0) {
-              this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+              this.eventEmitter.emit('CONSUMPTION_METADATA', this, {
                 type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
                 metricName: 'consumption.e2e.voip.stt.seconds',
                 credits: parsedData.connectDuration,
@@ -291,6 +300,15 @@ class BotiumConnectorVoip {
           if (parsedData && parsedData.type === 'error') {
             this.end = true
             reject(new Error(`Error: ${parsedData.message}`))
+            sendBotMsg(new Error(`Error: ${parsedData.message}`))
+          }
+
+          if (parsedData && parsedData.type === 'silence') {
+            this.end = true
+            if (parsedData.data.silence.length > 0) {
+              sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
+              this.Stop()
+            }
           }
 
           if (parsedData && parsedData.type === 'fullRecord') {
@@ -302,8 +320,9 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
-            if (this.connected) {
-              resolve()
+            if (this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
+              sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Start Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
+              this.Stop()
             }
             if (this.prevData) {
               if (!_.isNil(parsedData.data.start) && parsedData.data.start - this.prevData.data.end > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000) {
