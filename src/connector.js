@@ -42,7 +42,11 @@ const Capabilities = {
   VOIP_ICE_TURN_PASSWORD: 'VOIP_ICE_TURN_PASSWORD',
   VOIP_ICE_TURN_PROTOCOL: 'VOIP_ICE_TURN_PROTOCOL',
   VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 'VOIP_WEBSOCKET_CONNECT_MAXRETRIES',
-  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 'VOIP_WEBSOCKET_CONNECT_TIMEOUT'
+  VOIP_WEBSOCKET_CONNECT_TIMEOUT: 'VOIP_WEBSOCKET_CONNECT_TIMEOUT',
+  VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_ENABLE',
+  VOIP_SILENCE_DURATION_TIMEOUT: 'VOIP_SILENCE_DURATION_TIMEOUT',
+  VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE',
+  VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START'
 }
 
 const Defaults = {
@@ -51,11 +55,15 @@ const Defaults = {
   VOIP_TTS_METHOD: 'GET',
   VOIP_TTS_TIMEOUT: 10000,
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
-  VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 5000,
+  VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 500,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
   VOIP_WEBSOCKET_CONNECT_TIMEOUT: 4000,
-  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20
+  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20,
+  VOIP_SILENCE_DURATION_TIMEOUT: 2500,
+  VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: false,
+  VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
+  VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false
 }
 
 class BotiumConnectorVoip {
@@ -121,15 +129,21 @@ class BotiumConnectorVoip {
 
     const sendBotMsg = (botMsg) => { setTimeout(() => this.queueBotSays(botMsg), 0) }
 
-    const buildBotMsg = botMsgs => {
-      if (botMsgs.length === 1) return botMsgs[0]
+    const joinBotMsg = (botMsgs, joinLastPrevMsg) => {
       const botMsg = {}
       botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER])
       botMsg.sourceData = botMsgs.map(m => m.sourceData)
+      if (_.isNil(joinLastPrevMsg)) {
+        botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start
+        botMsg.sourceData[0].voiceDuration = botMsgs[botMsgs.length - 1].sourceData.data.end - botMsgs[0].sourceData.data.start
+      } else {
+        botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start - joinLastPrevMsg.sourceData.data.end
+        botMsg.sourceData[0].voiceDuration = botMsgs[botMsgs.length - 1].sourceData.data.end - botMsgs[0].sourceData.data.start
+      }
       return botMsg
     }
 
-    const expandBotMsgs = botMsgs => {
+    const splitBotMsgs = botMsgs => {
       const splitSentences = s => s.match(new RegExp(`[^${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+[${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+`, 'g'))
       const botMsgsFinal = []
       for (const botMsg of botMsgs) {
@@ -137,11 +151,13 @@ class BotiumConnectorVoip {
         if (_.isNil(sentences)) {
           botMsgsFinal.push(botMsg)
         } else {
+          let botMsgCount = 0
           for (const sentence of sentences) {
             botMsgsFinal.push({
               messageText: sentence,
-              sourceData: botMsg.sourceData
+              sourceData: (botMsgCount === 0) ? botMsg.sourceData : _.omit(botMsg.sourceData, ['silenceDuration'])
             })
+            botMsgCount++
           }
         }
       }
@@ -198,6 +214,10 @@ class BotiumConnectorVoip {
           }
         }
 
+        this.silence = null
+        this.msgCount = 0
+        this.firstMsg = true
+
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
         const request = {
@@ -218,6 +238,7 @@ class BotiumConnectorVoip {
           ICE_TURN_USERNAME: this.caps[Capabilities.VOIP_ICE_TURN_USER],
           ICE_TURN_PASSWORD: this.caps[Capabilities.VOIP_ICE_TURN_PASSWORD],
           ICE_TURN_PROTOCOL: this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
+          MIN_SILENCE_DURATION: this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_ENABLE] ? this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] : null,
           STT_CONFIG: {
             stt_url: this.caps[Capabilities.VOIP_STT_URL_STREAM],
             stt_params: this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
@@ -261,13 +282,13 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
-            this.connected = true
+            resolve()
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
             const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
             if (parsedData.connectDuration && parsedData.connectDuration > 0) {
-              this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+              this.eventEmitter.emit('CONSUMPTION_METADATA', this, {
                 type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
                 metricName: 'consumption.e2e.voip.stt.seconds',
                 credits: parsedData.connectDuration,
@@ -279,6 +300,15 @@ class BotiumConnectorVoip {
           if (parsedData && parsedData.type === 'error') {
             this.end = true
             reject(new Error(`Error: ${parsedData.message}`))
+            sendBotMsg(new Error(`Error: ${parsedData.message}`))
+          }
+
+          if (parsedData && parsedData.type === 'silence') {
+            this.end = true
+            if (parsedData.data.silence.length > 0) {
+              sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
+              this.Stop()
+            }
           }
 
           if (parsedData && parsedData.type === 'fullRecord') {
@@ -290,40 +320,66 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
-            if (this.connected) {
-              resolve()
+            if (this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
+              sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Start Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
+              this.Stop()
             }
-            if (!this.sentenceBuilding) {
-              this.sentenceBuilding = true
-              this.sentencesBuilding++
+            if (this.prevData) {
+              if (!_.isNil(parsedData.data.start) && parsedData.data.start - this.prevData.data.end > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000) {
+                if (this.botMsgs.length > 0) {
+                  sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
+                  this.firstMsg = false
+                  this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
+                  this.botMsgs = []
+                }
+              }
             }
           }
 
-          if (parsedData && parsedData.data && parsedData.data.final) {
-            const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
-            this.botMsgs.push(botMsg)
+          if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
+              let botMsg = { messageText: parsedData.data.message }
+              if (this.firstMsg) {
+                const sourceData = parsedData
+                sourceData.silenceDuration = parsedData.data.start
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
+                botMsg = Object.assign({}, botMsg, { sourceData })
+                this.firstMsg = false
+              } else {
+                const sourceData = parsedData
+                sourceData.silenceDuration = parsedData.data.start - this.prevData.data.end
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
+                botMsg = Object.assign({}, botMsg, { sourceData })
+              }
+              this.prevData = parsedData
+              this.botMsgs.push(botMsg)
               this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
               this.botMsgs = []
             }
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
-              const botMsgsExpanded = expandBotMsgs(this.botMsgs)
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'SPLIT' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
+              let botMsg = { messageText: parsedData.data.message }
+              if (this.firstMsg) {
+                const sourceData = parsedData
+                sourceData.silenceDuration = parsedData.data.start
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
+                botMsg = Object.assign({}, botMsg, { sourceData })
+                this.firstMsg = false
+              } else {
+                const sourceData = parsedData
+                sourceData.silenceDuration = parsedData.data.start - this.prevData.data.end
+                sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
+                botMsg = Object.assign({}, botMsg, { sourceData })
+              }
+              this.prevData = parsedData
+              this.botMsgs.push(botMsg)
+              const botMsgsExpanded = splitBotMsgs(this.botMsgs)
               botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
               this.botMsgs = []
             }
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
-              this.sentenceBuilding = false
-              this.sentencesFinal++
-
-              clearTimeout(this.sendMessageTimeout)
-              this.sendMessageTimeout = setTimeout(() => {
-                if (this.sentenceBuilding === false && this.sentencesBuilding === this.sentencesFinal) {
-                  sendBotMsg(buildBotMsg(this.botMsgs))
-                  this.botMsgs = []
-                  this.sentencesBuilding = 0
-                  this.sentencesFinal = 0
-                }
-              }, this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
+              const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
+              this.botMsgs.push(botMsg)
+              this.prevData = parsedData
             }
           }
         })
