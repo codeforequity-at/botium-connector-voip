@@ -10,6 +10,7 @@ module.exports = {
       audioInput: true,
       e2eTesting: true
     },
+    isAsync: true,
     capabilities: [
       {
         name: 'VOIP_STT',
