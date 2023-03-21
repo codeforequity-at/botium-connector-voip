@@ -207,6 +207,12 @@ class BotiumConnectorVoip {
       }
       connect().then(() => {
         this.eventEmitter.on('RETRY_CONVO_ASYNC_RETRIED', () => {
+          debug('Retry event received')
+          const request = JSON.stringify({
+            METHOD: 'stopCall',
+            sessionId: this.sessionId
+          })
+          this.ws.send(request)
           this.ws.close()
         })
         if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
