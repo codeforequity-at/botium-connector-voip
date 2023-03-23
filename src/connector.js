@@ -67,9 +67,10 @@ const Defaults = {
 }
 
 class BotiumConnectorVoip {
-  constructor ({ queueBotSays, eventEmitter, caps }) {
+  constructor ({ queueBotSays, eventEmitter, caps, setAsync }) {
+    setAsync(true)
     this.queueBotSays = queueBotSays
-    this.caps = Object.assign({}, caps, { RETRY_CONVO_ASYNC: true })
+    this.caps = caps
     this.eventEmitter = eventEmitter
     this.botMsgs = []
     this.sentencesBuilding = 0
