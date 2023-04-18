@@ -1,4 +1,3 @@
-const { v4: uuidv4 } = require('uuid')
 const WebSocket = require('ws')
 const _ = require('lodash')
 const axios = require('axios')
@@ -111,16 +110,6 @@ class BotiumConnectorVoip {
   async Start () {
     debug('Start called')
     debug(this.caps[Capabilities.VOIP_TTS_URL])
-
-    this.view = {
-      container: this,
-      context: {},
-      msg: {},
-      botium: {
-        conversationId: uuidv4(),
-        stepId: null
-      }
-    }
 
     this.stopCalled = false
 
@@ -327,6 +316,7 @@ class BotiumConnectorVoip {
               mimeType: 'audio/wav',
               base64: parsedData.fullRecord
             })
+            this.end = true
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
@@ -513,15 +503,15 @@ class BotiumConnectorVoip {
           if (this.end) {
             this.wsOpened = false
             this.ws = null
-            this.view = {}
+            this.end = false
             resolve()
           }
-        }, 1000)
+        }, 100)
       })
     } else {
       this.wsOpened = false
       this.ws = null
-      this.view = {}
+      this.end = false
     }
   }
 
