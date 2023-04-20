@@ -66,8 +66,7 @@ const Defaults = {
 }
 
 class BotiumConnectorVoip {
-  constructor ({ queueBotSays, eventEmitter, caps, setAsync }) {
-    setAsync(true)
+  constructor ({ queueBotSays, eventEmitter, caps }) {
     this.queueBotSays = queueBotSays
     this.caps = caps
     this.eventEmitter = eventEmitter
@@ -196,15 +195,6 @@ class BotiumConnectorVoip {
         })
       }
       connect().then(() => {
-        this.eventEmitter.on('RETRY_CONVO_ASYNC_RETRIED', () => {
-          debug('Retry event received')
-          const request = JSON.stringify({
-            METHOD: 'stopCall',
-            sessionId: this.sessionId
-          })
-          this.ws.send(request)
-          this.ws.close()
-        })
         if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
           if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
             this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
