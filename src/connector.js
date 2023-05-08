@@ -66,7 +66,7 @@ const Defaults = {
 }
 
 class BotiumConnectorVoip {
-  constructor ({ queueBotSays, eventEmitter, caps, ...rest }, x) {
+  constructor ({ queueBotSays, eventEmitter, caps }) {
     this.queueBotSays = queueBotSays
     this.caps = caps
     this.eventEmitter = eventEmitter
@@ -74,7 +74,6 @@ class BotiumConnectorVoip {
     this.sentencesBuilding = 0
     this.sentencesFinal = 0
     this.sentenceBuilding = false
-    debug('haha ' + JSON.stringify(rest, null, 2) + x)
   }
 
   async Validate () {
