@@ -115,6 +115,7 @@ class BotiumConnectorVoip {
     this.fullRecord = ''
     this.end = false
     this.connected = false
+    this.convoStep = null
 
     const sendBotMsg = (botMsg) => { setTimeout(() => this.queueBotSays(botMsg), 0) }
 
@@ -203,9 +204,14 @@ class BotiumConnectorVoip {
           }
         }
 
+        this.eventEmitter.on('CONVO_STEP_NEXT', (container, convoStep) => {
+          this.convoStep = convoStep
+        })
+
         this.silence = null
         this.msgCount = 0
         this.firstMsg = true
+        this.firstSttInfoReceived = false
 
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
@@ -293,10 +299,9 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'silence') {
-            this.end = true
-            if (parsedData.data.silence.length > 0) {
+            if (this.convoStep && this.convoStep.logicHooks && _.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')) && parsedData.data.silence.length > 0) {
+              this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
-              this.Stop()
             }
           }
 
@@ -310,10 +315,11 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
-            if (this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
-              sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Start Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
-              this.Stop()
+            if (!this.firstSttInfoReceived && this.convoStep && this.convoStep.logicHooks && _.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
+              this.end = true
+              sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Initial Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
             }
+            this.firstSttInfoReceived = true
             if (this.prevData) {
               if (!_.isNil(parsedData.data.start) && parsedData.data.start - this.prevData.data.end > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000) {
                 if (this.botMsgs.length > 0) {
@@ -494,6 +500,8 @@ class BotiumConnectorVoip {
             this.wsOpened = false
             this.ws = null
             this.end = false
+            this.convoStep = null
+            this.firstSttInfoReceived = false
             resolve()
           }
         }, 100)
@@ -502,6 +510,8 @@ class BotiumConnectorVoip {
       this.wsOpened = false
       this.ws = null
       this.end = false
+      this.convoStep = null
+      this.firstSttInfoReceived = false
     }
   }
 
