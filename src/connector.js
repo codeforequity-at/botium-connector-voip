@@ -316,7 +316,6 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
-            console.log('hahaha', this.convoStep, this.firstSttInfoReceived)
             if (!this.firstSttInfoReceived && this.convoStep && this.convoStep.logicHooks && _.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
               this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Initial Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
