@@ -162,7 +162,7 @@ class BotiumConnectorVoip {
         data: {
           API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
         },
-        url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
+        url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'subscribeCall')).toString()
       })
       data = res.data
       headers = res.headers
@@ -216,7 +216,7 @@ class BotiumConnectorVoip {
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
         const request = {
-          METHOD: 'initCall',
+          METHOD: 'subscribeCall',
           SIP_CALLER_AUTO: this.caps[Capabilities.VOIP_SIP_POOL_CALLER_ENABLE],
           SIP_PROXY: this.caps[Capabilities.VOIP_SIP_PROXY],
           SIP_CALLER_URI: this.caps[Capabilities.VOIP_SIP_CALLER_URI],
