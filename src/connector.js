@@ -428,7 +428,6 @@ class BotiumConnectorVoip {
               const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
               this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
                 type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
-                category: 'e2e_voice_ivr',
                 metricName: 'consumption.e2e.voip.tts.characters',
                 credits: msg.messageText.length,
                 apiKey
