@@ -325,8 +325,17 @@ class BotiumConnectorVoip {
             }
             this.firstSttInfoReceived = true
             if (this.prevData) {
-              if (!_.isNil(parsedData.data.start) && ((this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' && (parsedData.data.start - this.prevData.data.end > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000)) || (!_.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION')) && parsedData.data.start - this.prevData.data.end > parseInt(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION').args[0]) / 1000))) {
-                if (this.botMsgs.length > 0) {
+              if (!_.isNil(parsedData.data.start)) {
+                const silenceDuration = parsedData.data.start - this.prevData.data.end
+                const joinLogicHook = this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION')
+                const isJoinMethod = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN'
+                let matched = false
+                if ((!_.isNil(joinLogicHook) && silenceDuration > parseInt(joinLogicHook.args[0])) / 1000) {
+                  matched = true
+                } else if ((_.isNil(joinLogicHook) && isJoinMethod && (silenceDuration > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000))) {
+                  matched = true
+                }
+                if (matched && this.botMsgs.length > 0) {
                   sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
                   this.firstMsg = false
                   this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
