@@ -1,5 +1,6 @@
 const BotiumConnectorVoip = require('./src/connector')
 const IgnoreSilenceDurationLogicHook = require('./src/ignore-sd-logichook')
+const JoinLogicHook = require('./src/join-logichook')
 
 module.exports = {
   PluginVersion: 1,
@@ -27,6 +28,7 @@ module.exports = {
     ]
   },
   PluginLogicHooks: {
-    VOIP_IGNORE_SILENCE_DURATION: IgnoreSilenceDurationLogicHook
+    VOIP_IGNORE_SILENCE_DURATION: IgnoreSilenceDurationLogicHook,
+    VOIP_JOIN_SILENCE_DURATION: JoinLogicHook
   }
 }
