@@ -300,7 +300,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'silence') {
-            if (this.convoStep && this.convoStep.logicHooks && _.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')) && parsedData.data.silence.length > 0) {
+            if (this._getJoinLogicHook(this.convoStep) && parsedData.data.silence.length > 0) {
               this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
             }
@@ -319,7 +319,7 @@ class BotiumConnectorVoip {
             if (this.silenceTimeout) {
               clearTimeout(this.silenceTimeout)
             }
-            if (!this.firstSttInfoReceived && this.convoStep && this.convoStep.logicHooks && _.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
+            if (!this.firstSttInfoReceived && this._getJoinLogicHook(this.convoStep) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
               this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Initial Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
             }
@@ -327,7 +327,7 @@ class BotiumConnectorVoip {
             if (this.prevData) {
               if (!_.isNil(parsedData.data.start)) {
                 const silenceDuration = parsedData.data.start - this.prevData.data.end
-                const joinLogicHook = this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION')
+                const joinLogicHook = this._getJoinLogicHook(this.convoStep)
                 const isJoinMethod = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN'
                 let matched = false
                 if ((!_.isNil(joinLogicHook) && silenceDuration > parseInt(joinLogicHook.args[0])) / 1000) {
@@ -346,7 +346,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && _.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION'))) {
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep)))) {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
                 const sourceData = parsedData
@@ -385,7 +385,7 @@ class BotiumConnectorVoip {
               botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
               this.botMsgs = []
             }
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT' || !_.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION'))) {
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT' || !_.isNil(this._getJoinLogicHook(this.convoStep))) {
               const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
               this.botMsgs.push(botMsg)
               this.prevData = parsedData
@@ -396,7 +396,7 @@ class BotiumConnectorVoip {
                   this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
                   this.botMsgs = []
                 }
-              }, (!_.isNil(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION')) && parseInt(this.convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION').args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+              }, (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
             }
           }
         })
@@ -593,6 +593,12 @@ class BotiumConnectorVoip {
       _.get(body, 'awstranscribe.credentials.accessKeyId') ||
       _.get(body, 'azure.credentials.subscriptionKey') ||
       null
+  }
+
+  _getJoinLogicHook (convoStep) {
+    if (_.isNil(convoStep)) return null
+    if (_.isNil(convoStep.logicHooks)) return null
+    return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION')
   }
 }
 
