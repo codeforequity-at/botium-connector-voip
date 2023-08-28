@@ -300,7 +300,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'silence') {
-            if (this._getJoinLogicHook(this.convoStep) && parsedData.data.silence.length > 0) {
+            if (_.isNil(this._getJoinLogicHook(this.convoStep)) && parsedData.data.silence.length > 0) {
               this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
             }
