@@ -301,7 +301,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'silence') {
-            if (this._getJoinLogicHook(this.convoStep) && parsedData.data.silence.length > 0) {
+            if (_.isNil(this._getJoinLogicHook(this.convoStep)) && parsedData.data.silence.length > 0) {
               this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
             }
@@ -320,7 +320,7 @@ class BotiumConnectorVoip {
             if (this.silenceTimeout) {
               clearTimeout(this.silenceTimeout)
             }
-            if (!this.firstSttInfoReceived && this._getJoinLogicHook(this.convoStep) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
+            if (!this.firstSttInfoReceived && _.isNil(this._getJoinLogicHook(this.convoStep)) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
               this.end = true
               sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Initial Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
             }
