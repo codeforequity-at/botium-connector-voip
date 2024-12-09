@@ -58,7 +58,7 @@ const Defaults = {
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
   VOIP_WEBSOCKET_CONNECT_TIMEOUT: 4000,
-  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 20,
+  VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 5,
   VOIP_SILENCE_DURATION_TIMEOUT: 2500,
   VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: false,
   VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
@@ -156,19 +156,33 @@ class BotiumConnectorVoip {
 
     let data = null
     let headers = null
-    try {
-      const res = await axios({
-        method: 'post',
-        data: {
-          API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
-        },
-        url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
-      })
-      data = res.data
-      headers = res.headers
-    } catch (err) {
-      return Promise.reject(new Error(`Connecting to VOIP Worker failed: ${err.response.data.message || 'Not reachable'}`))
+    const connect = async (retryIndex) => {
+      retryIndex = retryIndex || 0
+      try {
+        const res = await axios({
+          method: 'post',
+          data: {
+            API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
+          },
+          url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
+        })
+        if (res) {
+          data = res.data
+          headers = res.headers
+        }
+      } catch (err) {
+        debug(`Retry ${retryIndex} / ${this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]}: Connecting to VOIP Worker failed: ${err.message || 'Not reachable'}`)
+        if (retryIndex === this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]) {
+          throw new Error(`Connecting to VOIP Worker failed: ${err.message || 'Not reachable'}`)
+        }
+        // Retry after the defined timeout
+        await new Promise(resolve => setTimeout(resolve, this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_TIMEOUT]))
+
+        // Retry the connection
+        await connect(retryIndex + 1)
+      }
     }
+    await connect()
 
     return new Promise((resolve, reject) => {
       const wsEndpoint = `${this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
@@ -263,7 +277,7 @@ class BotiumConnectorVoip {
           const parsedDataLog = _.cloneDeep(parsedData)
           parsedDataLog.fullRecord = '<full_record_buffer>'
 
-          debug(JSON.stringify(parsedDataLog, null, 2))
+          // debug(JSON.stringify(parsedDataLog, null, 2))
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
             this.sessionId = parsedData.voipConfig.sessionId
@@ -335,7 +349,7 @@ class BotiumConnectorVoip {
                 const joinLogicHook = this._getJoinLogicHook(this.convoStep)
                 const isJoinMethod = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN'
                 let matched = false
-                if ((!_.isNil(joinLogicHook) && silenceDuration > parseInt(joinLogicHook.args[0])) / 1000) {
+                if ((!_.isNil(joinLogicHook) && isJoinMethod && silenceDuration > parseInt(joinLogicHook.args[0])) / 1000) {
                   matched = true
                 } else if ((_.isNil(joinLogicHook) && isJoinMethod && (silenceDuration > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000))) {
                   matched = true
@@ -396,6 +410,8 @@ class BotiumConnectorVoip {
               this.prevData = parsedData
               this.silenceTimeout = setTimeout(() => {
                 if (this.botMsgs.length > 0) {
+                  debug('l222')
+                  debug((this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
                   sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
                   this.firstMsg = false
                   this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
