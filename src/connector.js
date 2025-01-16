@@ -368,6 +368,7 @@ class BotiumConnectorVoip {
 
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
             const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]
+            debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]})`)
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep)))) {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
