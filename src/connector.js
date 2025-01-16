@@ -45,7 +45,8 @@ const Capabilities = {
   VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_ENABLE',
   VOIP_SILENCE_DURATION_TIMEOUT: 'VOIP_SILENCE_DURATION_TIMEOUT',
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE',
-  VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START'
+  VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START',
+  VOIP_STT_CONFIDENCE_THRESHOLD: 'VOIP_STT_CONFIDENCE_THRESHOLD'
 }
 
 const Defaults = {
@@ -62,7 +63,8 @@ const Defaults = {
   VOIP_SILENCE_DURATION_TIMEOUT: 2500,
   VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: false,
   VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
-  VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false
+  VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false,
+  VOIP_STT_CONFIDENCE_THRESHOLD: 0.5
 }
 
 class BotiumConnectorVoip {
@@ -365,6 +367,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
+            const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep)))) {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
@@ -380,8 +383,10 @@ class BotiumConnectorVoip {
                 botMsg = Object.assign({}, botMsg, { sourceData })
               }
               this.prevData = parsedData
-              this.botMsgs.push(botMsg)
-              this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
+              if (successfulConfidenceScore) {
+                this.botMsgs.push(botMsg)
+                this.botMsgs.forEach(botMsg => sendBotMsg(botMsg))
+              }
               this.botMsgs = []
             }
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'SPLIT' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
@@ -399,25 +404,28 @@ class BotiumConnectorVoip {
                 botMsg = Object.assign({}, botMsg, { sourceData })
               }
               this.prevData = parsedData
-              this.botMsgs.push(botMsg)
-              const botMsgsExpanded = splitBotMsgs(this.botMsgs)
-              botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
+              if (successfulConfidenceScore) {
+                this.botMsgs.push(botMsg)
+                const botMsgsExpanded = splitBotMsgs(this.botMsgs)
+                botMsgsExpanded.forEach(botMsg => sendBotMsg(botMsg))
+              }
               this.botMsgs = []
             }
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT' || !_.isNil(this._getJoinLogicHook(this.convoStep))) {
               const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
-              this.botMsgs.push(botMsg)
               this.prevData = parsedData
-              this.silenceTimeout = setTimeout(() => {
-                if (this.botMsgs.length > 0) {
-                  debug('l222')
-                  debug((this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
-                  sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
-                  this.firstMsg = false
-                  this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
-                  this.botMsgs = []
-                }
-              }, (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+              if (successfulConfidenceScore) {
+                this.botMsgs.push(botMsg)
+                this.silenceTimeout = setTimeout(() => {
+                  if (this.botMsgs.length > 0) {
+                    debug((this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                    sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
+                    this.firstMsg = false
+                    this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
+                    this.botMsgs = []
+                  }
+                }, (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+              }
             }
           }
         })
@@ -626,6 +634,17 @@ class BotiumConnectorVoip {
     if (_.isNil(convoStep)) return null
     if (_.isNil(convoStep.logicHooks)) return null
     return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')
+  }
+
+  _getConfidenceScore (parsedData) {
+    // Azure Speech Service
+    if (parsedData?.data?.source?.debug?.privJson) {
+      const privJson = JSON.parse(parsedData?.data?.source?.debug?.privJson)
+      if (privJson && privJson.NBest && privJson.NBest.length > 0) {
+        return Math.max(...privJson.NBest.map(n => n.Confidence))
+      }
+    }
+    return null
   }
 }
 
