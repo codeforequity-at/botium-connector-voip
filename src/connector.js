@@ -3,6 +3,7 @@ const _ = require('lodash')
 const axios = require('axios')
 const debug = require('debug')('botium-connector-voip')
 const path = require('path')
+const mm = require('music-metadata')
 
 const Capabilities = {
   VOIP_STT_URL_STREAM: 'VOIP_STT_URL_STREAM',
@@ -123,7 +124,7 @@ class BotiumConnectorVoip {
 
     const joinBotMsg = (botMsgs, joinLastPrevMsg) => {
       const botMsg = {}
-      botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER])
+      botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER] || '')
       botMsg.sourceData = botMsgs.map(m => m.sourceData)
       if (_.isNil(joinLastPrevMsg)) {
         botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start
@@ -515,24 +516,20 @@ class BotiumConnectorVoip {
             mimeType: msg.media[0].mimeType,
             base64: msg.media[0].buffer.toString('base64')
           })
-          const { data } = await axios({
-            method: 'post',
-            data: msg.media[0].buffer,
-            headers: {
-              ...this._getHeaders(Capabilities.VOIP_TTS_HEADERS),
-              'Content-Type': 'audio/wave'
-            },
-            url: this._getAxiosUrl(this.caps.VOIP_TTS_URL, '/api/audio/info'),
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity
-          })
-          if (data && data.duration) {
-            duration = parseInt(data.duration)
-          } else {
-            reject(new Error('Getting audio duration from Speech Api failed'))
+
+          try {
+            const metadata = await mm.parseBuffer(msg.media[0].buffer)
+            if (metadata && metadata.format && metadata.format.duration) {
+              debug('Audio duration of user audio:', metadata.format.duration, 'seconds')
+              duration = Math.round(metadata.format.duration * 1000) // Convert to milliseconds
+            } else {
+              reject(new Error('Could not determine audio duration from metadata'))
+            }
+          } catch (err) {
+            reject(new Error(`Getting audio duration failed: ${err.message}`))
           }
         }
-        setTimeout(resolve, duration * 1000)
+        setTimeout(resolve, duration)
       }, 0)
     })
   }
