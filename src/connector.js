@@ -521,7 +521,7 @@ class BotiumConnectorVoip {
             const metadata = await mm.parseBuffer(msg.media[0].buffer)
             if (metadata && metadata.format && metadata.format.duration) {
               debug('Audio duration of user audio:', metadata.format.duration, 'seconds')
-              duration = Math.round(metadata.format.duration * 1000) // Convert to milliseconds
+              duration = Math.round(metadata.format.duration)
             } else {
               reject(new Error('Could not determine audio duration from metadata'))
             }
@@ -529,7 +529,7 @@ class BotiumConnectorVoip {
             reject(new Error(`Getting audio duration failed: ${err.message}`))
           }
         }
-        setTimeout(resolve, duration)
+        setTimeout(resolve, duration * 1000)
       }, 0)
     })
   }
