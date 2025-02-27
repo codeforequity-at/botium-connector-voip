@@ -1,6 +1,6 @@
 {
   "name": "botium-connector-voip",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "description": "Botium Voice over IP Connector",
   "main": "dist/botium-connector-voip-cjs.js",
   "module": "dist/botium-connector-voip-es.js",
@@ -31,7 +31,8 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.9.2",
-    "debug": "^4.1.1"
+    "debug": "^4.1.1",
+    "music-metadata": "^7.14.0"
   },
   "peerDependencies": {
     "botium-core": ">= 1.7.3"

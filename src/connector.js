@@ -3,6 +3,7 @@ const _ = require('lodash')
 const axios = require('axios')
 const debug = require('debug')('botium-connector-voip')
 const path = require('path')
+const mm = require('music-metadata')
 
 const Capabilities = {
   VOIP_STT_URL_STREAM: 'VOIP_STT_URL_STREAM',
@@ -123,7 +124,7 @@ class BotiumConnectorVoip {
 
     const joinBotMsg = (botMsgs, joinLastPrevMsg) => {
       const botMsg = {}
-      botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER])
+      botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER] || '')
       botMsg.sourceData = botMsgs.map(m => m.sourceData)
       if (_.isNil(joinLastPrevMsg)) {
         botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start
@@ -367,8 +368,9 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
-            const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]
-            debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]})`)
+            const confidenceThreshold = ((this._getConfidenceScoreLogicHook(this.convoStep) && this._getConfidenceScoreLogicHook(this.convoStep).args[0]) || this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD])
+            const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
+            debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep)))) {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
@@ -419,7 +421,7 @@ class BotiumConnectorVoip {
                 this.botMsgs.push(botMsg)
                 this.silenceTimeout = setTimeout(() => {
                   if (this.botMsgs.length > 0) {
-                    debug((this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                    debug('Silence Duration Timeout (PSST):', (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT], 'ms')
                     sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
                     this.firstMsg = false
                     this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
@@ -514,21 +516,17 @@ class BotiumConnectorVoip {
             mimeType: msg.media[0].mimeType,
             base64: msg.media[0].buffer.toString('base64')
           })
-          const { data } = await axios({
-            method: 'post',
-            data: msg.media[0].buffer,
-            headers: {
-              ...this._getHeaders(Capabilities.VOIP_TTS_HEADERS),
-              'Content-Type': 'audio/wave'
-            },
-            url: this._getAxiosUrl(this.caps.VOIP_TTS_URL, '/api/audio/info'),
-            maxContentLength: Infinity,
-            maxBodyLength: Infinity
-          })
-          if (data && data.duration) {
-            duration = parseInt(data.duration)
-          } else {
-            reject(new Error('Getting audio duration from Speech Api failed'))
+
+          try {
+            const metadata = await mm.parseBuffer(msg.media[0].buffer)
+            if (metadata && metadata.format && metadata.format.duration) {
+              debug('Audio duration of user audio:', metadata.format.duration, 'seconds')
+              duration = Math.round(metadata.format.duration)
+            } else {
+              reject(new Error('Could not determine audio duration from metadata'))
+            }
+          } catch (err) {
+            reject(new Error(`Getting audio duration failed: ${err.message}`))
           }
         }
         setTimeout(resolve, duration * 1000)
@@ -635,6 +633,12 @@ class BotiumConnectorVoip {
     if (_.isNil(convoStep)) return null
     if (_.isNil(convoStep.logicHooks)) return null
     return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')
+  }
+
+  _getConfidenceScoreLogicHook (convoStep) {
+    if (_.isNil(convoStep)) return null
+    if (_.isNil(convoStep.logicHooks)) return null
+    return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_CONFIDENCE_THRESHOLD')
   }
 
   _getConfidenceScore (parsedData) {
