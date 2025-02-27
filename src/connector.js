@@ -367,8 +367,9 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
-            const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]
-            debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD]})`)
+            const confidenceThreshold = ((this._getConfidenceScoreLogicHook(this.convoStep) && this._getConfidenceScoreLogicHook(this.convoStep).args[0]) || this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD])
+            const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
+            debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep)))) {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
@@ -419,7 +420,7 @@ class BotiumConnectorVoip {
                 this.botMsgs.push(botMsg)
                 this.silenceTimeout = setTimeout(() => {
                   if (this.botMsgs.length > 0) {
-                    debug((this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                    debug('Silence Duration Timeout (PSST):', (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT], 'ms')
                     sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
                     this.firstMsg = false
                     this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
@@ -635,6 +636,12 @@ class BotiumConnectorVoip {
     if (_.isNil(convoStep)) return null
     if (_.isNil(convoStep.logicHooks)) return null
     return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_IGNORE_SILENCE_DURATION')
+  }
+
+  _getConfidenceScoreLogicHook (convoStep) {
+    if (_.isNil(convoStep)) return null
+    if (_.isNil(convoStep.logicHooks)) return null
+    return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_CONFIDENCE_THRESHOLD')
   }
 
   _getConfidenceScore (parsedData) {
