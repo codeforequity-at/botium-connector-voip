@@ -47,7 +47,8 @@ const Capabilities = {
   VOIP_SILENCE_DURATION_TIMEOUT: 'VOIP_SILENCE_DURATION_TIMEOUT',
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE',
   VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START',
-  VOIP_STT_CONFIDENCE_THRESHOLD: 'VOIP_STT_CONFIDENCE_THRESHOLD'
+  VOIP_STT_CONFIDENCE_THRESHOLD: 'VOIP_STT_CONFIDENCE_THRESHOLD',
+  VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER'
 }
 
 const Defaults = {
@@ -65,7 +66,8 @@ const Defaults = {
   VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: false,
   VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false,
-  VOIP_STT_CONFIDENCE_THRESHOLD: 0.5
+  VOIP_STT_CONFIDENCE_THRESHOLD: 0.5,
+  VOIP_USE_GLOBAL_VOIP_WORKER: false
 }
 
 class BotiumConnectorVoip {
@@ -165,9 +167,9 @@ class BotiumConnectorVoip {
         const res = await axios({
           method: 'post',
           data: {
-            API_KEY: this.caps[Capabilities.VOIP_WORKER_APIKEY]
+            API_KEY: this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_APIKEY : this.caps[Capabilities.VOIP_WORKER_APIKEY]
           },
-          url: new URL(path.join(`${this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
+          url: new URL(path.join(`${this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_URL : this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
         })
         if (res) {
           data = res.data
@@ -188,7 +190,7 @@ class BotiumConnectorVoip {
     await connect()
 
     return new Promise((resolve, reject) => {
-      const wsEndpoint = `${this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
+      const wsEndpoint = `${this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_URL : this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
       const connect = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
