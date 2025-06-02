@@ -216,7 +216,7 @@ class BotiumConnectorVoip {
       }
       connect().then(() => {
         if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
-          if (this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] === '') {
+          if (_.isEmpty(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
             this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
           } else {
             this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = this.caps[Capabilities.VOIP_ICE_STUN_SERVERS].split(',')
