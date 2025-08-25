@@ -285,10 +285,16 @@ class BotiumConnectorVoip {
           const parsedDataLog = _.cloneDeep(parsedData)
           parsedDataLog.fullRecord = '<full_record_buffer>'
 
-          // debug(JSON.stringify(parsedDataLog, null, 2))
+          debug(JSON.stringify(parsedDataLog, null, 2))
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
             this.sessionId = parsedData.voipConfig.sessionId
+          }
+
+          // if sessionId is not the same as the one in the callinfo, return
+          if (parsedData && parsedData.voipConfig && parsedData.voipConfig.sessionId && parsedData.voipConfig.sessionId !== this.sessionId) {
+            debug('sessionId mismatch, returning')
+            return
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
