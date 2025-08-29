@@ -1,6 +1,6 @@
 {
   "name": "botium-connector-voip",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "description": "Botium Voice over IP Connector",
   "main": "dist/botium-connector-voip-cjs.js",
   "module": "dist/botium-connector-voip-es.js",
