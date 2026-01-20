@@ -571,6 +571,19 @@ class BotiumConnectorVoip {
           })
           this.ws.send(request)
         } else if (msg && msg.messageText) {
+          // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
+          const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
+          if (dtmfMatch && dtmfMatch[1]) {
+            const digits = dtmfMatch[1]
+            debug(`Sending DTMF from messageText: ${digits}`)
+            const request = JSON.stringify({
+              METHOD: 'sendDtmf',
+              digits,
+              sessionId: this.sessionId
+            })
+            this.ws.send(request)
+            return resolve()
+          }
           if (!this.axiosTtsParams) {
             if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
               return reject(new Error('TTS not configured, only audio input supported'))
