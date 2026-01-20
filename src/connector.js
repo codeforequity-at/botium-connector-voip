@@ -1,6 +1,8 @@
 const WebSocket = require('ws')
 const _ = require('lodash')
 const axios = require('axios')
+const http = require('http')
+const https = require('https')
 const debug = require('debug')('botium-connector-voip')
 const path = require('path')
 const mm = require('music-metadata')
@@ -23,6 +25,9 @@ const Capabilities = {
   VOIP_TTS_BODY: 'VOIP_TTS_BODY',
   VOIP_TTS_HEADERS: 'VOIP_TTS_HEADERS',
   VOIP_TTS_TIMEOUT: 'VOIP_TTS_TIMEOUT',
+  VOIP_TTS_CACHE_ENABLE: 'VOIP_TTS_CACHE_ENABLE',
+  VOIP_TTS_CACHE_SIZE: 'VOIP_TTS_CACHE_SIZE',
+  VOIP_TTS_PREFETCH_ENABLE: 'VOIP_TTS_PREFETCH_ENABLE',
   VOIP_WORKER_URL: 'VOIP_WORKER_URL',
   VOIP_WORKER_APIKEY: 'VOIP_WORKER_APIKEY',
   VOIP_SIP_POOL_CALLER_ENABLE: 'VOIP_SIP_POOL_CALLER_ENABLE',
@@ -57,6 +62,9 @@ const Defaults = {
   VOIP_STT_TIMEOUT: 10000,
   VOIP_TTS_METHOD: 'GET',
   VOIP_TTS_TIMEOUT: 10000,
+  VOIP_TTS_CACHE_ENABLE: true,
+  VOIP_TTS_CACHE_SIZE: 50,
+  VOIP_TTS_PREFETCH_ENABLE: true,
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 2500,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
@@ -72,6 +80,9 @@ const Defaults = {
   VOIP_SIP_PROTOCOL: 'TCP'
 }
 
+const TTS_HTTP_AGENT = new http.Agent({ keepAlive: true })
+const TTS_HTTPS_AGENT = new https.Agent({ keepAlive: true })
+
 class BotiumConnectorVoip {
   constructor ({ queueBotSays, eventEmitter, caps }) {
     this.queueBotSays = queueBotSays
@@ -81,10 +92,19 @@ class BotiumConnectorVoip {
     this.sentencesBuilding = 0
     this.sentencesFinal = 0
     this.sentenceBuilding = false
+    this.ttsCache = new Map()
+    this.ttsCacheEnabled = false
+    this.ttsCacheMaxEntries = 0
+    this.ttsPrefetchEnabled = false
+
+    // For debugging latency between incoming STT (bot says) and outgoing audio (sendAudio)
+    this._lastBotSaysQueuedAt = null
+    this._lastBotSaysText = null
   }
 
   async Validate () {
     debug('Validate called')
+    this.caps = Object.assign({}, Defaults, this.caps)
     debug(this.caps.VOIP_STT_MESSAGE_HANDLING)
 
     if (this.caps.VOIP_TTS_URL) {
@@ -93,7 +113,9 @@ class BotiumConnectorVoip {
         params: this._getParams(Capabilities.VOIP_TTS_PARAMS),
         method: this.caps.VOIP_TTS_METHOD,
         timeout: this.caps.VOIP_TTS_TIMEOUT,
-        headers: this._getHeaders(Capabilities.VOIP_TTS_HEADERS)
+        headers: this._getHeaders(Capabilities.VOIP_TTS_HEADERS),
+        httpAgent: TTS_HTTP_AGENT,
+        httpsAgent: TTS_HTTPS_AGENT
       }
       try {
         const { data } = await axios({
@@ -109,8 +131,10 @@ class BotiumConnectorVoip {
         throw new Error(`Checking TTS Status failed - ${this._getAxiosErrOutput(err)}`)
       }
     }
-
-    this.caps = Object.assign({}, Defaults, this.caps)
+    const cacheSize = parseInt(this.caps[Capabilities.VOIP_TTS_CACHE_SIZE], 10)
+    this.ttsCacheEnabled = !!this.caps[Capabilities.VOIP_TTS_CACHE_ENABLE]
+    this.ttsCacheMaxEntries = _.isFinite(cacheSize) && cacheSize > 0 ? cacheSize : 0
+    this.ttsPrefetchEnabled = !!this.caps[Capabilities.VOIP_TTS_PREFETCH_ENABLE]
   }
 
   async Start () {
@@ -123,8 +147,17 @@ class BotiumConnectorVoip {
     this.end = false
     this.connected = false
     this.convoStep = null
+    this._lastBotSaysQueuedAt = null
+    this._lastBotSaysText = null
+    if (this.ttsCache) {
+      this.ttsCache.clear()
+    }
 
-    const sendBotMsg = (botMsg) => { setTimeout(() => this.queueBotSays(botMsg), 0) }
+    const sendBotMsg = (botMsg) => {
+      this._lastBotSaysQueuedAt = Date.now()
+      this._lastBotSaysText = botMsg && botMsg.messageText ? String(botMsg.messageText) : null
+      setTimeout(() => this.queueBotSays(botMsg), 0)
+    }
 
     const joinBotMsg = (botMsgs, joinLastPrevMsg) => {
       const botMsg = {}
@@ -227,6 +260,35 @@ class BotiumConnectorVoip {
 
         this.eventEmitter.on('CONVO_STEP_NEXT', (container, convoStep) => {
           this.convoStep = convoStep
+          this._maybePrefetchTts(convoStep)
+          // For PSST: send join silence duration per step to VOIP worker (controls PSST silence trigger)
+          try {
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' && this.ws && this.ws.readyState === WebSocket.OPEN) {
+              const joinLogicHook = this._getJoinLogicHook(convoStep)
+              let silenceMs = null
+              if (joinLogicHook && joinLogicHook.args && joinLogicHook.args.length > 0) {
+                silenceMs = parseInt(joinLogicHook.args[0], 10)
+              }
+              // Fallback to global timeout if no per-step hook is set
+              if (!_.isFinite(silenceMs) || silenceMs <= 0) {
+                silenceMs = parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT], 10)
+              }
+              // PSST: treat like JOIN, but subtract 500ms from timeout
+              if (_.isFinite(silenceMs) && silenceMs > 0) {
+                silenceMs = Math.max(0, silenceMs - 500)
+              }
+              if (_.isFinite(silenceMs) && silenceMs > 0 && this.sessionId) {
+                debug(`PSST: sending silenceDurationMs=${silenceMs} for sessionId=${this.sessionId}`)
+                this.ws.send(JSON.stringify({
+                  METHOD: 'setSttSilenceDuration',
+                  sessionId: this.sessionId,
+                  silenceDurationMs: silenceMs
+                }))
+              }
+            }
+          } catch (err) {
+            debug(`Failed sending PSST silence duration to VOIP worker: ${err.message || err}`)
+          }
         })
 
         this.silence = null
@@ -237,6 +299,18 @@ class BotiumConnectorVoip {
 
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
+        const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+        const isPsst = sttHandling === 'PSST'
+        const sttLegacy = true
+        let sttUrl = this.caps[Capabilities.VOIP_STT_URL_STREAM]
+        if (isPsst && _.isString(sttUrl)) {
+          const replaced = sttUrl.replace('/api/sttstream/', '/api/stt/')
+          if (replaced !== sttUrl) {
+            sttUrl = replaced
+          } else {
+            debug(`PSST: Could not derive /api/stt url from ${sttUrl}, using as-is`)
+          }
+        }
         const request = {
           METHOD: 'initCall',
           SIP_CALLER_AUTO: this.caps[Capabilities.VOIP_SIP_POOL_CALLER_ENABLE],
@@ -257,8 +331,9 @@ class BotiumConnectorVoip {
           ICE_TURN_PASSWORD: this.caps[Capabilities.VOIP_ICE_TURN_PASSWORD],
           ICE_TURN_PROTOCOL: this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
           MIN_SILENCE_DURATION: this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_ENABLE] ? this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] : null,
+          STT_LEGACY: sttLegacy,
           STT_CONFIG: {
-            stt_url: this.caps[Capabilities.VOIP_STT_URL_STREAM],
+            stt_url: sttUrl,
             stt_params: this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
             stt_body: this.caps[Capabilities.VOIP_STT_BODY_STREAM] || null
           },
@@ -361,12 +436,25 @@ class BotiumConnectorVoip {
               if (!_.isNil(parsedData.data.start)) {
                 const silenceDuration = parsedData.data.start - this.prevData.data.end
                 const joinLogicHook = this._getJoinLogicHook(this.convoStep)
-                const isJoinMethod = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN'
+                const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+                const isPsst = sttHandling === 'PSST'
+                const isJoinMethod = sttHandling === 'JOIN' || isPsst
+                const toJoinTimeoutMs = (ms) => {
+                  const parsed = parseInt(ms, 10)
+                  if (!_.isFinite(parsed) || parsed <= 0) return null
+                  return isPsst ? Math.max(0, parsed - 500) : parsed
+                }
                 let matched = false
-                if ((!_.isNil(joinLogicHook) && isJoinMethod && silenceDuration > parseInt(joinLogicHook.args[0])) / 1000) {
-                  matched = true
-                } else if ((_.isNil(joinLogicHook) && isJoinMethod && (silenceDuration > parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]) / 1000))) {
-                  matched = true
+                if (!_.isNil(joinLogicHook) && isJoinMethod) {
+                  const joinTimeoutMs = toJoinTimeoutMs(joinLogicHook && joinLogicHook.args && joinLogicHook.args[0])
+                  if (_.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && silenceDuration > (joinTimeoutMs / 1000)) {
+                    matched = true
+                  }
+                } else if (_.isNil(joinLogicHook) && isJoinMethod) {
+                  const joinTimeoutMs = toJoinTimeoutMs(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                  if (_.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && silenceDuration > (joinTimeoutMs / 1000)) {
+                    matched = true
+                  }
                 }
                 if (matched && this.botMsgs.length > 0) {
                   sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
@@ -382,7 +470,10 @@ class BotiumConnectorVoip {
             const confidenceThreshold = ((this._getConfidenceScoreLogicHook(this.convoStep) && this._getConfidenceScoreLogicHook(this.convoStep).args[0]) || this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD])
             const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
             debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep)))) {
+            // ORIGINAL: emit final message immediately, unless join hooks are active.
+            if (
+              (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep))))
+            ) {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
                 const sourceData = parsedData
@@ -425,20 +516,32 @@ class BotiumConnectorVoip {
               }
               this.botMsgs = []
             }
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT' || !_.isNil(this._getJoinLogicHook(this.convoStep))) {
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT' || (!_.isNil(this._getJoinLogicHook(this.convoStep)))) {
               const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
               this.prevData = parsedData
               if (successfulConfidenceScore) {
                 this.botMsgs.push(botMsg)
+                const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+                const isPsst = sttHandling === 'PSST'
+                const toJoinTimeoutMs = (ms) => {
+                  const parsed = parseInt(ms, 10)
+                  if (!_.isFinite(parsed) || parsed <= 0) return null
+                  return isPsst ? Math.max(0, parsed - 500) : parsed
+                }
+                const joinLogicHook = this._getJoinLogicHook(this.convoStep)
+                let joinTimeoutMs = toJoinTimeoutMs(_.get(joinLogicHook, 'args[0]'))
+                if (!_.isFinite(joinTimeoutMs) || joinTimeoutMs <= 0) {
+                  joinTimeoutMs = toJoinTimeoutMs(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                }
                 this.silenceTimeout = setTimeout(() => {
                   if (this.botMsgs.length > 0) {
-                    debug('Silence Duration Timeout (PSST):', (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT], 'ms')
+                    debug('Silence Duration Timeout (JOIN/PSST):', joinTimeoutMs, 'ms')
                     sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
                     this.firstMsg = false
                     this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
                     this.botMsgs = []
                   }
-                }, (this._getJoinLogicHook(this.convoStep) && parseInt(this._getJoinLogicHook(this.convoStep).args[0])) || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                }, joinTimeoutMs || 0)
               }
             }
           }
@@ -468,24 +571,20 @@ class BotiumConnectorVoip {
           })
           this.ws.send(request)
         } else if (msg && msg.messageText) {
-          if (!this.axiosTtsParams) reject(new Error('TTS not configured, only audio input supported'))
-          if (this.axiosTtsParams) {
-            const ttsRequest = {
-              ...this.axiosTtsParams,
-              params: {
-                ...(this.axiosTtsParams.params || {}),
-                text: msg.messageText
-              },
-              data: this._getBody(Capabilities.VOIP_TTS_BODY),
-              responseType: 'arraybuffer'
+          if (!this.axiosTtsParams) {
+            if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
+              return reject(new Error('TTS not configured, only audio input supported'))
             }
+          } else {
+            const ttsRequest = this._buildTtsRequest(msg.messageText)
+            if (!ttsRequest) return reject(new Error('TTS not configured, only audio input supported'))
             msg.sourceData = ttsRequest
 
-            let ttsResponse = null
+            let ttsResult = null
             try {
-              ttsResponse = await axios(ttsRequest)
+              ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
             } catch (err) {
-              reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
+              return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
             }
             if (msg && msg.messageText && msg.messageText.length > 0) {
               const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
@@ -496,22 +595,28 @@ class BotiumConnectorVoip {
                 apiKey
               })
             }
-            if (Buffer.isBuffer(ttsResponse.data)) {
-              duration = ttsResponse.headers['content-duration']
+            if (ttsResult && Buffer.isBuffer(ttsResult.buffer)) {
+              duration = parseFloat(ttsResult.duration) || 0
+              const b64Buffer = ttsResult.buffer.toString('base64')
               const request = JSON.stringify({
                 METHOD: 'sendAudio',
                 PESQ: false,
                 sessionId: this.sessionId,
-                b64_buffer: ttsResponse.data.toString('base64')
+                b64_buffer: b64Buffer
               })
+              if (this._lastBotSaysQueuedAt) {
+                const latencyMs = Date.now() - this._lastBotSaysQueuedAt
+                const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
+                debug(`Latency (bot says -> sendAudio/TTS): ${latencyMs} ms (last bot: ${botText})`)
+              }
               msg.attachments.push({
                 name: 'tts.wav',
                 mimeType: 'audio/wav',
-                base64: ttsResponse.data.toString('base64')
+                base64: b64Buffer
               })
               this.ws.send(request)
             } else {
-              reject(new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse.data)}`))
+              return reject(new Error('TTS failed, response is empty'))
             }
           }
         }
@@ -521,6 +626,11 @@ class BotiumConnectorVoip {
             sessionId: this.sessionId,
             b64_buffer: msg.media[0].buffer.toString('base64')
           })
+          if (this._lastBotSaysQueuedAt) {
+            const latencyMs = Date.now() - this._lastBotSaysQueuedAt
+            const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
+            debug(`Latency (bot says -> sendAudio/MEDIA): ${latencyMs} ms (last bot: ${botText})`)
+          }
           this.ws.send(request)
           msg.attachments.push({
             name: msg.media[0].mediaUri,
@@ -573,6 +683,134 @@ class BotiumConnectorVoip {
       this.convoStep = null
       this.firstSttInfoReceived = false
     }
+  }
+
+  _isTtsCacheEnabled () {
+    return this.ttsCacheEnabled && this.ttsCacheMaxEntries > 0
+  }
+
+  _touchTtsCache (cacheKey, entry) {
+    if (!this._isTtsCacheEnabled()) return
+    this.ttsCache.delete(cacheKey)
+    this.ttsCache.set(cacheKey, entry)
+  }
+
+  _setTtsCacheEntry (cacheKey, entry) {
+    if (!this._isTtsCacheEnabled()) return
+    this.ttsCache.set(cacheKey, entry)
+    this._trimTtsCache()
+  }
+
+  _deleteTtsCacheEntry (cacheKey) {
+    if (this.ttsCache) {
+      this.ttsCache.delete(cacheKey)
+    }
+  }
+
+  _trimTtsCache () {
+    if (!this._isTtsCacheEnabled()) return
+    while (this.ttsCache.size > this.ttsCacheMaxEntries) {
+      const oldestKey = this.ttsCache.keys().next().value
+      this.ttsCache.delete(oldestKey)
+    }
+  }
+
+  _shouldPrefetchTtsText (text) {
+    if (!_.isString(text)) return false
+    if (!text.trim()) return false
+    return !/\$[A-Za-z]\w*/.test(text)
+  }
+
+  _maybePrefetchTts (convoStep) {
+    if (!this.ttsPrefetchEnabled || !this._isTtsCacheEnabled()) return
+    if (!convoStep || convoStep.sender !== 'me') return
+    if (!this._shouldPrefetchTtsText(convoStep.messageText)) return
+    const ttsRequest = this._buildTtsRequest(convoStep.messageText)
+    if (!ttsRequest) return
+    this._getTtsAudio(ttsRequest, convoStep.messageText).catch(err => {
+      debug(`TTS prefetch failed - ${this._getAxiosErrOutput(err)}`)
+    })
+  }
+
+  _buildTtsRequest (text) {
+    if (!this.axiosTtsParams) return null
+    return {
+      ...this.axiosTtsParams,
+      params: {
+        ...(this.axiosTtsParams.params || {}),
+        text
+      },
+      data: this._getBody(Capabilities.VOIP_TTS_BODY),
+      responseType: 'arraybuffer'
+    }
+  }
+
+  _getTtsCacheKey (ttsRequest) {
+    const cacheKeyObj = {
+      url: ttsRequest.url,
+      method: ttsRequest.method,
+      params: ttsRequest.params,
+      data: ttsRequest.data
+    }
+    try {
+      return JSON.stringify(cacheKeyObj)
+    } catch (err) {
+      return `${ttsRequest.url}|${ttsRequest.method}|${_.get(ttsRequest, 'params.text', '')}`
+    }
+  }
+
+  async _fetchTts (ttsRequest, text) {
+    const ttsStart = Date.now()
+    const ttsResponse = await axios(ttsRequest)
+    const ttsMs = Date.now() - ttsStart
+    const textLen = _.isString(text) ? text.length : 0
+    debug(`TTS response ${ttsMs} ms (chars: ${textLen})`)
+
+    if (!ttsResponse || !Buffer.isBuffer(ttsResponse.data)) {
+      throw new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse && ttsResponse.data)}`)
+    }
+    const durationHeader = ttsResponse.headers && ttsResponse.headers['content-duration']
+    return {
+      buffer: ttsResponse.data,
+      duration: durationHeader
+    }
+  }
+
+  async _getTtsAudio (ttsRequest, text) {
+    if (!ttsRequest) throw new Error('TTS request not configured')
+    const cacheKey = this._getTtsCacheKey(ttsRequest)
+
+    if (this._isTtsCacheEnabled()) {
+      const cached = this.ttsCache.get(cacheKey)
+      if (cached) {
+        if (cached.state === 'ready') {
+          this._touchTtsCache(cacheKey, cached)
+          debug(`TTS cache hit (chars: ${_.isString(text) ? text.length : 0})`)
+          return { buffer: cached.buffer, duration: cached.duration }
+        }
+        if (cached.state === 'pending') {
+          return cached.promise
+        }
+      }
+    }
+
+    const fetchPromise = this._fetchTts(ttsRequest, text)
+      .then(result => {
+        if (this._isTtsCacheEnabled()) {
+          this._setTtsCacheEntry(cacheKey, { state: 'ready', buffer: result.buffer, duration: result.duration })
+        }
+        return result
+      })
+      .catch(err => {
+        this._deleteTtsCacheEntry(cacheKey)
+        throw err
+      })
+
+    if (this._isTtsCacheEnabled()) {
+      this._setTtsCacheEntry(cacheKey, { state: 'pending', promise: fetchPromise })
+    }
+
+    return fetchPromise
   }
 
   _getParams (capParams) {
