@@ -163,12 +163,17 @@ class BotiumConnectorVoip {
       const botMsg = {}
       botMsg.messageText = botMsgs.map(m => m.messageText).join(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER] || '')
       botMsg.sourceData = botMsgs.map(m => m.sourceData)
-      if (_.isNil(joinLastPrevMsg)) {
-        botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start
-        botMsg.sourceData[0].voiceDuration = botMsgs[botMsgs.length - 1].sourceData.data.end - botMsgs[0].sourceData.data.start
+      const firstStart = _.get(botMsgs, '[0].sourceData.data.start', null)
+      const lastEnd = _.get(botMsgs, `[${botMsgs.length - 1}].sourceData.data.end`, null)
+      const prevEnd = _.get(joinLastPrevMsg, 'sourceData.data.end', null)
+      // joinLastPrevMsg can be null (first joined message) OR incomplete (in case JOIN timeout fired before we got any final STT info).
+      // In those cases, fall back to "start-of-first-chunk" semantics (same as previous behaviour for nil joinLastPrevMsg).
+      if (_.isFinite(firstStart) && _.isFinite(lastEnd)) {
+        botMsg.sourceData[0].silenceDuration = (_.isFinite(prevEnd) ? (firstStart - prevEnd) : firstStart)
+        botMsg.sourceData[0].voiceDuration = lastEnd - firstStart
       } else {
-        botMsg.sourceData[0].silenceDuration = botMsgs[0].sourceData.data.start - joinLastPrevMsg.sourceData.data.end
-        botMsg.sourceData[0].voiceDuration = botMsgs[botMsgs.length - 1].sourceData.data.end - botMsgs[0].sourceData.data.start
+        botMsg.sourceData[0].silenceDuration = _.isFinite(firstStart) ? firstStart : null
+        botMsg.sourceData[0].voiceDuration = (_.isFinite(firstStart) && _.isFinite(lastEnd)) ? (lastEnd - firstStart) : null
       }
       return botMsg
     }
@@ -356,11 +361,107 @@ class BotiumConnectorVoip {
         })
         this.ws.on('message', async (data) => {
           const parsedData = JSON.parse(data)
+          // Allow fullRecord delivery even if Stop() was already called.
+          // Otherwise the recording can be dropped if the worker streams it late (common on hangup).
+          if (this.stopCalled) {
+            const allowedTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error']
+            if (!parsedData || !parsedData.type || !allowedTypes.includes(parsedData.type)) {
+              debug(`${this.sessionId} - Stop already called, ignoring incoming message`)
+              return
+            }
+          }
 
           const parsedDataLog = _.cloneDeep(parsedData)
-          parsedDataLog.fullRecord = '<full_record_buffer>'
+          // Sanitize all potential base64 fields for logging (don't dump huge buffers)
+          const sanitizeBase64Fields = (obj, prefix = '') => {
+            if (!obj || typeof obj !== 'object') return
+            for (const key of Object.keys(obj)) {
+              const val = obj[key]
+              if (typeof val === 'string' && val.length > 500) {
+                obj[key] = `<base64:${val.length}chars>`
+              } else if (val && typeof val === 'object' && !Array.isArray(val)) {
+                sanitizeBase64Fields(val, `${prefix}${key}.`)
+              }
+            }
+          }
+          sanitizeBase64Fields(parsedDataLog)
 
           debug(JSON.stringify(parsedDataLog, null, 2))
+
+          const _extractFullRecordBase64 = (pd) => {
+            if (!pd) return null
+            // Different VOIP workers may put the payload in various fields - search all string fields
+            // First try known field names
+            const knownFields = [
+              pd.fullRecord,
+              pd.full_record,
+              pd.data?.fullRecord,
+              pd.data?.full_record,
+              pd.data?.b64_buffer,
+              pd.data?.base64,
+              pd.data?.full_record_buffer,
+              pd.data?.buffer,
+              pd.buffer,
+              pd.base64,
+              pd.audio,
+              pd.audioData,
+              pd.data?.audio,
+              pd.data?.audioData
+            ]
+            for (const val of knownFields) {
+              if (typeof val === 'string' && val.length > 100) return val
+            }
+            // Fallback: find any large string field (likely base64)
+            const findLargeString = (obj, depth = 0) => {
+              if (!obj || typeof obj !== 'object' || depth > 3) return null
+              for (const key of Object.keys(obj)) {
+                const val = obj[key]
+                if (typeof val === 'string' && val.length > 1000) {
+                  debug(`${this.sessionId} - Found base64 in field '${key}' (len=${val.length})`)
+                  return val
+                }
+                if (val && typeof val === 'object' && !Array.isArray(val)) {
+                  const found = findLargeString(val, depth + 1)
+                  if (found) return found
+                }
+              }
+              return null
+            }
+            return findLargeString(pd)
+          }
+
+          const emitFullRecordAttachment = (base64) => {
+            if (!base64 || typeof base64 !== 'string' || base64.length === 0) {
+              // Log available fields (length only) to help diagnose worker payload shape without dumping base64
+              try {
+                const candidates = {
+                  fullRecord: typeof parsedData?.fullRecord === 'string' ? parsedData.fullRecord.length : null,
+                  full_record: typeof parsedData?.full_record === 'string' ? parsedData.full_record.length : null,
+                  data_fullRecord: typeof parsedData?.data?.fullRecord === 'string' ? parsedData.data.fullRecord.length : null,
+                  data_full_record: typeof parsedData?.data?.full_record === 'string' ? parsedData.data.full_record.length : null,
+                  data_b64_buffer: typeof parsedData?.data?.b64_buffer === 'string' ? parsedData.data.b64_buffer.length : null,
+                  data_base64: typeof parsedData?.data?.base64 === 'string' ? parsedData.data.base64.length : null,
+                  data_full_record_buffer: typeof parsedData?.data?.full_record_buffer === 'string' ? parsedData.data.full_record_buffer.length : null,
+                  data_buffer: typeof parsedData?.data?.buffer === 'string' ? parsedData.data.buffer.length : null
+                }
+                debug(`${this.sessionId} - fullRecordEnd received but base64 is empty, skipping attachment emit. CandidateLengths=${JSON.stringify(candidates)}`)
+              } catch (err) {
+                debug(`${this.sessionId} - fullRecordEnd received but base64 is empty, skipping attachment emit (diag failed: ${err.message || err})`)
+              }
+              return
+            }
+            debug(`${this.sessionId} - Emitting MESSAGE_ATTACHMENT full_record.wav (base64Len=${base64.length}, stopCalled=${!!this.stopCalled})`)
+            this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
+              name: 'full_record.wav',
+              mimeType: 'audio/wav',
+              base64,
+              // Session context from capabilities for correlation
+              sessionContext: {
+                testSessionId: this.caps.VOIP_TEST_SESSION_ID || null,
+                testSessionJobId: this.caps.VOIP_TEST_SESSION_JOB_ID || null
+              }
+            })
+          }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
             this.sessionId = parsedData.voipConfig.sessionId
@@ -403,6 +504,22 @@ class BotiumConnectorVoip {
             sendBotMsg(new Error(`Error: ${parsedData.message}`))
           }
 
+          // Full record streaming support:
+          // - some VOIP workers send the recording in chunks and an end marker
+          if (parsedData && parsedData.type === 'fullRecordStart') {
+            this.fullRecord = ''
+          }
+          if (parsedData && parsedData.type === 'fullRecordChunk') {
+            const chunk = _extractFullRecordBase64(parsedData)
+            if (chunk) this.fullRecord = (this.fullRecord || '') + chunk
+          }
+          if (parsedData && parsedData.type === 'fullRecordEnd') {
+            const tail = _extractFullRecordBase64(parsedData)
+            if (tail) this.fullRecord = (this.fullRecord || '') + tail
+            emitFullRecordAttachment(this.fullRecord || tail)
+            this.end = true
+          }
+
           if (parsedData && parsedData.type === 'silence') {
             if (_.isNil(this._getIgnoreSilenceDurationAsserterLogicHook(this.convoStep))) {
               if (_.isNil(this._getJoinLogicHook(this.convoStep)) && parsedData.data.silence.length > 0) {
@@ -413,11 +530,8 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'fullRecord') {
-            this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
-              name: 'full_record.wav',
-              mimeType: 'audio/wav',
-              base64: parsedData.fullRecord
-            })
+            // Non-chunked full record
+            emitFullRecordAttachment(_extractFullRecordBase64(parsedData))
             this.end = true
           }
 
@@ -432,7 +546,7 @@ class BotiumConnectorVoip {
               }
             }
             this.firstSttInfoReceived = true
-            if (this.prevData) {
+            if (this.prevData && this.prevData.data && !_.isNil(this.prevData.data.end)) {
               if (!_.isNil(parsedData.data.start)) {
                 const silenceDuration = parsedData.data.start - this.prevData.data.end
                 const joinLogicHook = this._getJoinLogicHook(this.convoStep)
@@ -483,7 +597,9 @@ class BotiumConnectorVoip {
                 this.firstMsg = false
               } else {
                 const sourceData = parsedData
-                sourceData.silenceDuration = parsedData.data.start - this.prevData.data.end
+                const start = _.get(parsedData, 'data.start', null)
+                const prevEnd = _.get(this.prevData, 'data.end', null)
+                sourceData.silenceDuration = (_.isFinite(start) && _.isFinite(prevEnd)) ? (start - prevEnd) : (_.isFinite(start) ? start : null)
                 sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
               }
@@ -504,7 +620,9 @@ class BotiumConnectorVoip {
                 this.firstMsg = false
               } else {
                 const sourceData = parsedData
-                sourceData.silenceDuration = parsedData.data.start - this.prevData.data.end
+                const start = _.get(parsedData, 'data.start', null)
+                const prevEnd = _.get(this.prevData, 'data.end', null)
+                sourceData.silenceDuration = (_.isFinite(start) && _.isFinite(prevEnd)) ? (start - prevEnd) : (_.isFinite(start) ? start : null)
                 sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
               }
@@ -554,8 +672,24 @@ class BotiumConnectorVoip {
 
   async UserSays (msg) {
     debug('UserSays called')
-
-    debug(msg)
+    // Avoid logging large buffers/base64 (can break job logs and overwhelm stdout)
+    try {
+      const safeLog = {
+        messageText: msg && msg.messageText ? String(msg.messageText).substring(0, 200) : undefined,
+        buttons: msg && Array.isArray(msg.buttons) ? msg.buttons.length : 0,
+        hasMedia: !!(msg && msg.media && msg.media.length > 0),
+        mediaMimeType: msg && msg.media && msg.media[0] ? msg.media[0].mimeType : undefined,
+        mediaSize: msg && msg.media && msg.media[0] && Buffer.isBuffer(msg.media[0].buffer) ? msg.media[0].buffer.length : undefined,
+        attachments: msg && Array.isArray(msg.attachments) ? msg.attachments.map(a => ({
+          name: a && (a.name || a.title),
+          mimeType: a && a.mimeType,
+          base64Len: a && a.base64 ? a.base64.length : 0
+        })) : []
+      }
+      debug(safeLog)
+    } catch (err) {
+      debug(`UserSays: failed to build safe log: ${err.message || err}`)
+    }
 
     if (!msg.attachments) {
       msg.attachments = []
@@ -670,6 +804,11 @@ class BotiumConnectorVoip {
 
   async Stop () {
     debug(`${this.sessionId} - Stop called`)
+    this.stopCalled = true
+    if (this.silenceTimeout) {
+      clearTimeout(this.silenceTimeout)
+      this.silenceTimeout = null
+    }
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
       const request = JSON.stringify({
         METHOD: 'stopCall',
@@ -677,9 +816,12 @@ class BotiumConnectorVoip {
       })
       this.ws.send(request)
       await new Promise(resolve => {
-        setTimeout(resolve, 100000)
-        setInterval(() => {
+        const stopTimeout = setTimeout(resolve, 100000)
+        this._stopWaitInterval = setInterval(() => {
           if (this.end) {
+            clearTimeout(stopTimeout)
+            clearInterval(this._stopWaitInterval)
+            this._stopWaitInterval = null
             this.wsOpened = false
             this.ws = null
             this.end = false
