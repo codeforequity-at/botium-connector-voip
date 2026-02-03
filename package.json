@@ -8,8 +8,7 @@
     "build": "npm run eslint && rollup -c",
     "eslint": "eslint index.js src",
     "eslint-fix": "eslint --fix index.js src",
-    "test": "echo Just placeholder, no tests here yet",
-    "prepare": "npm run build"
+    "test": "echo Just placeholder, no tests here yet"
   },
   "author": "Botium GmbH",
   "license": "MIT",
