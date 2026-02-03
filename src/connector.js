@@ -4,7 +4,6 @@ const axios = require('axios')
 const http = require('http')
 const https = require('https')
 const debug = require('debug')('botium-connector-voip')
-const path = require('path')
 const mm = require('music-metadata')
 
 const Capabilities = {
@@ -204,12 +203,16 @@ class BotiumConnectorVoip {
     const connect = async (retryIndex) => {
       retryIndex = retryIndex || 0
       try {
+        const workerUrl = this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER]
+          ? process.env.BOTIUM_VOIP_WORKER_URL
+          : this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')
+        const baseUrl = workerUrl.endsWith('/') ? workerUrl.slice(0, -1) : workerUrl
         const res = await axios({
           method: 'post',
           data: {
             API_KEY: this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_APIKEY : this.caps[Capabilities.VOIP_WORKER_APIKEY]
           },
-          url: new URL(path.join(`${this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_URL : this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')}`, 'initCall')).toString()
+          url: `${baseUrl}/initCall`
         })
         if (res) {
           data = res.data
