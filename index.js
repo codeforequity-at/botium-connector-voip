@@ -25,6 +25,13 @@ module.exports = {
         label: 'Speech Synthesis Profile',
         type: 'speechsynthesisprofile',
         required: true
+      },
+      {
+        name: 'VOIP_USER_INPUT_PREFER_VOICE',
+        label: 'Prefer voice media when both text and voice present',
+        type: 'boolean',
+        required: false,
+        advanced: true
       }
     ]
   },
