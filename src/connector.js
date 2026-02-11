@@ -6,6 +6,17 @@ const https = require('https')
 const debug = require('debug')('botium-connector-voip')
 const mm = require('music-metadata')
 
+// Logging policy: info = rare, business-relevant lifecycle events (always visible).
+// debug = high-frequency diagnostics (DEBUG=botium-connector-voip). warn = degraded but continuing.
+// error = abort/failure. No secrets in info; STT text only as length or truncated in info.
+
+const _info = (event, data) => {
+  const parts = Object.entries({ event, ...data })
+    .filter(([, v]) => v != null && v !== '')
+    .map(([k, v]) => `${k}=${typeof v === 'string' && v.length > 80 ? `"${v.substring(0, 77)}..."` : JSON.stringify(v)}`)
+  console.info(`[botium-connector-voip] ${parts.join(' ')}`)
+}
+
 const Capabilities = {
   VOIP_STT_URL_STREAM: 'VOIP_STT_URL_STREAM',
   VOIP_STT_PARAMS_STREAM: 'VOIP_STT_PARAMS_STREAM',
@@ -53,7 +64,8 @@ const Capabilities = {
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE',
   VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START',
   VOIP_STT_CONFIDENCE_THRESHOLD: 'VOIP_STT_CONFIDENCE_THRESHOLD',
-  VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER'
+  VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER',
+  VOIP_USER_INPUT_PREFER_VOICE: 'VOIP_USER_INPUT_PREFER_VOICE'
 }
 
 const Defaults = {
@@ -76,7 +88,8 @@ const Defaults = {
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false,
   VOIP_STT_CONFIDENCE_THRESHOLD: 0.5,
   VOIP_USE_GLOBAL_VOIP_WORKER: false,
-  VOIP_SIP_PROTOCOL: 'TCP'
+  VOIP_SIP_PROTOCOL: 'TCP',
+  VOIP_USER_INPUT_PREFER_VOICE: true
 }
 
 const TTS_HTTP_AGENT = new http.Agent({ keepAlive: true })
@@ -200,7 +213,8 @@ class BotiumConnectorVoip {
 
     let data = null
     let headers = null
-    const connect = async (retryIndex) => {
+    let httpInitRetries = 0
+    const connectHttp = async (retryIndex) => {
       retryIndex = retryIndex || 0
       try {
         const workerUrl = this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER]
@@ -223,18 +237,22 @@ class BotiumConnectorVoip {
         if (retryIndex === this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]) {
           throw new Error(`Connecting to VOIP Worker failed: ${err.message || 'Not reachable'}`)
         }
+        httpInitRetries = retryIndex + 1
         // Retry after the defined timeout
         await new Promise(resolve => setTimeout(resolve, this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_TIMEOUT]))
 
         // Retry the connection
-        await connect(retryIndex + 1)
+        await connectHttp(retryIndex + 1)
       }
     }
-    await connect()
+    await connectHttp()
+    if (httpInitRetries > 0) {
+      _info('connected_after_retries', { phase: 'initCall', retries: httpInitRetries })
+    }
 
     return new Promise((resolve, reject) => {
       const wsEndpoint = `${this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_URL : this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
-      const connect = (retryIndex) => {
+      const connectWs = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
           if ('set-cookie' in headers) {
@@ -247,17 +265,20 @@ class BotiumConnectorVoip {
             this.ws = new WebSocket(wsEndpoint)
           }
           this.ws.on('open', () => {
-            resolve()
+            resolve(retryIndex)
           })
           this.ws.on('error', () => {
             if (retryIndex === this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]) {
               reject(new Error(`Websocket connection failed to ${wsEndpoint}`))
             }
-            setTimeout(() => connect(retryIndex + 1).then(resolve).catch(reject), this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_TIMEOUT])
+            setTimeout(() => connectWs(retryIndex + 1).then(resolve).catch(reject), this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_TIMEOUT])
           })
         })
       }
-      connect().then(() => {
+      connectWs().then((wsRetries) => {
+        if (wsRetries > 0) {
+          _info('connected_after_retries', { phase: 'websocket', retries: wsRetries })
+        }
         if (!_.isArray(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
           if (_.isEmpty(this.caps[Capabilities.VOIP_ICE_STUN_SERVERS])) {
             this.caps[Capabilities.VOIP_ICE_STUN_SERVERS] = []
@@ -301,6 +322,7 @@ class BotiumConnectorVoip {
 
         this.silence = null
         this.msgCount = 0
+        this.sttPartialCount = 0
         this.firstMsg = true
         this.firstSttInfoReceived = false
         this.silenceTimeout = null
@@ -468,6 +490,10 @@ class BotiumConnectorVoip {
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
             this.sessionId = parsedData.voipConfig.sessionId
+            _info('callinfo_initialized', {
+              sessionId: this.sessionId,
+              sttHandling: this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+            })
           }
 
           // if sessionId is not the same as the one in the callinfo, return
@@ -485,10 +511,16 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
+            _info('callinfo_connected', { sessionId: this.sessionId })
             resolve()
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
+            _info('callinfo_disconnected', {
+              sessionId: this.sessionId,
+              connectDurationSec: parsedData.connectDuration || null,
+              sttPartialCount: this.sttPartialCount
+            })
             const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
             if (parsedData.connectDuration && parsedData.connectDuration > 0) {
               this.eventEmitter.emit('CONSUMPTION_METADATA', this, {
@@ -519,7 +551,9 @@ class BotiumConnectorVoip {
           if (parsedData && parsedData.type === 'fullRecordEnd') {
             const tail = _extractFullRecordBase64(parsedData)
             if (tail) this.fullRecord = (this.fullRecord || '') + tail
+            const base64Len = (this.fullRecord || tail || '').length
             emitFullRecordAttachment(this.fullRecord || tail)
+            _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecordEnd', base64Len })
             this.end = true
           }
 
@@ -534,11 +568,14 @@ class BotiumConnectorVoip {
 
           if (parsedData && parsedData.type === 'fullRecord') {
             // Non-chunked full record
-            emitFullRecordAttachment(_extractFullRecordBase64(parsedData))
+            const base64 = _extractFullRecordBase64(parsedData)
+            emitFullRecordAttachment(base64)
+            _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecord', base64Len: (base64 || '').length })
             this.end = true
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
+            this.sttPartialCount++
             if (this.silenceTimeout) {
               clearTimeout(this.silenceTimeout)
             }
@@ -586,7 +623,18 @@ class BotiumConnectorVoip {
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
             const confidenceThreshold = ((this._getConfidenceScoreLogicHook(this.convoStep) && this._getConfidenceScoreLogicHook(this.convoStep).args[0]) || this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD])
             const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
+            const msgText = parsedData.data.message || ''
+            const msgLen = typeof msgText === 'string' ? msgText.length : 0
+            const msgPreview = typeof msgText === 'string' ? msgText.trim().substring(0, 80) : ''
             debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
+            _info('stt_final', {
+              sessionId: this.sessionId,
+              message: msgPreview,
+              messageLength: msgLen,
+              confidence: this._getConfidenceScore(parsedData),
+              threshold: confidenceThreshold,
+              accepted: successfulConfidenceScore
+            })
             // ORIGINAL: emit final message immediately, unless join hooks are active.
             if (
               (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep))))
@@ -675,6 +723,19 @@ class BotiumConnectorVoip {
 
   async UserSays (msg) {
     debug('UserSays called')
+    const hasText = !!(msg && msg.messageText)
+    const hasVoiceMedia = !!(msg && msg.media && msg.media.length > 0 && msg.media[0].buffer)
+    const hasDtmf = !!(msg && msg.buttons && msg.buttons.length > 0)
+    const dtmfMatch = msg && msg.messageText && msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
+    const inputType = hasDtmf || dtmfMatch ? 'dtmf' : (hasText && hasVoiceMedia ? 'mixed' : hasText ? 'text' : hasVoiceMedia ? 'media' : 'unknown')
+    const msgPreview = hasText && msg.messageText ? String(msg.messageText).trim().substring(0, 80) : ''
+    _info('user_says', {
+      sessionId: this.sessionId,
+      inputType,
+      message: msgPreview || undefined,
+      messageLength: hasText && msg.messageText ? msg.messageText.length : undefined,
+      mediaSize: hasVoiceMedia && msg.media[0] && Buffer.isBuffer(msg.media[0].buffer) ? msg.media[0].buffer.length : undefined
+    })
     // Avoid logging large buffers/base64 (can break job logs and overwhelm stdout)
     try {
       const safeLog = {
@@ -700,6 +761,11 @@ class BotiumConnectorVoip {
     return new Promise((resolve, reject) => {
       setTimeout(async () => {
         let duration = 0
+        const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
+        const preferVoice = !!preferVoiceCapRaw
+        const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
+        debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
+
         if (msg && msg.buttons && msg.buttons.length > 0) {
           const request = JSON.stringify({
             METHOD: 'sendDtmf',
@@ -721,56 +787,62 @@ class BotiumConnectorVoip {
             this.ws.send(request)
             return resolve()
           }
-          if (!this.axiosTtsParams) {
-            if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
-              return reject(new Error('TTS not configured, only audio input supported'))
+          if (!skipTtsForMixedInput) {
+            if (!this.axiosTtsParams) {
+              if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
+                return reject(new Error('TTS not configured, only audio input supported'))
+              }
+            } else {
+              debug('UserSays routing: executing TTS branch')
+              const ttsRequest = this._buildTtsRequest(msg.messageText)
+              if (!ttsRequest) return reject(new Error('TTS not configured, only audio input supported'))
+              msg.sourceData = ttsRequest
+
+              let ttsResult = null
+              try {
+                ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
+              } catch (err) {
+                return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
+              }
+              if (msg && msg.messageText && msg.messageText.length > 0) {
+                const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
+                this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+                  type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
+                  metricName: 'consumption.e2e.voip.tts.characters',
+                  transactions: msg.messageText.length,
+                  apiKey
+                })
+              }
+              if (ttsResult && Buffer.isBuffer(ttsResult.buffer)) {
+                duration = parseFloat(ttsResult.duration) || 0
+                const b64Buffer = ttsResult.buffer.toString('base64')
+                const request = JSON.stringify({
+                  METHOD: 'sendAudio',
+                  PESQ: false,
+                  sessionId: this.sessionId,
+                  b64_buffer: b64Buffer
+                })
+                if (this._lastBotSaysQueuedAt) {
+                  const latencyMs = Date.now() - this._lastBotSaysQueuedAt
+                  const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
+                  debug(`Latency (bot says -> sendAudio/TTS): ${latencyMs} ms (last bot: ${botText})`)
+                }
+                msg.attachments.push({
+                  name: 'tts.wav',
+                  mimeType: 'audio/wav',
+                  base64: b64Buffer
+                })
+                this.ws.send(request)
+              } else {
+                return reject(new Error('TTS failed, response is empty'))
+              }
             }
           } else {
-            const ttsRequest = this._buildTtsRequest(msg.messageText)
-            if (!ttsRequest) return reject(new Error('TTS not configured, only audio input supported'))
-            msg.sourceData = ttsRequest
-
-            let ttsResult = null
-            try {
-              ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
-            } catch (err) {
-              return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
-            }
-            if (msg && msg.messageText && msg.messageText.length > 0) {
-              const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
-              this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
-                type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
-                metricName: 'consumption.e2e.voip.tts.characters',
-                transactions: msg.messageText.length,
-                apiKey
-              })
-            }
-            if (ttsResult && Buffer.isBuffer(ttsResult.buffer)) {
-              duration = parseFloat(ttsResult.duration) || 0
-              const b64Buffer = ttsResult.buffer.toString('base64')
-              const request = JSON.stringify({
-                METHOD: 'sendAudio',
-                PESQ: false,
-                sessionId: this.sessionId,
-                b64_buffer: b64Buffer
-              })
-              if (this._lastBotSaysQueuedAt) {
-                const latencyMs = Date.now() - this._lastBotSaysQueuedAt
-                const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
-                debug(`Latency (bot says -> sendAudio/TTS): ${latencyMs} ms (last bot: ${botText})`)
-              }
-              msg.attachments.push({
-                name: 'tts.wav',
-                mimeType: 'audio/wav',
-                base64: b64Buffer
-              })
-              this.ws.send(request)
-            } else {
-              return reject(new Error('TTS failed, response is empty'))
-            }
+            debug('UserSays routing: skipping TTS for mixed input because VOIP_USER_INPUT_PREFER_VOICE is enabled')
           }
         }
         if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
+          debug('UserSays routing: executing MEDIA branch')
           const request = JSON.stringify({
             METHOD: 'sendAudio',
             sessionId: this.sessionId,
