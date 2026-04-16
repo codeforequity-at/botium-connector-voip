@@ -17,6 +17,12 @@ const _info = (event, data) => {
   console.info(`[botium-connector-voip] ${parts.join(' ')}`)
 }
 
+/** DTMF for RTP/PJSIP: 0–9, *, #, A–D. Strips spaces and other separators so the worker gets one compact string. */
+const sanitizeDtmfDigits = (raw) => {
+  if (raw == null) return ''
+  return String(raw).replace(/[^0-9*#ABCDabcd]/g, '').toUpperCase()
+}
+
 const Capabilities = {
   VOIP_STT_URL_STREAM: 'VOIP_STT_URL_STREAM',
   VOIP_STT_PARAMS_STREAM: 'VOIP_STT_PARAMS_STREAM',
@@ -767,9 +773,15 @@ class BotiumConnectorVoip {
         debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
         if (msg && msg.buttons && msg.buttons.length > 0) {
+          const digits = sanitizeDtmfDigits(msg.buttons[0].payload)
+          if (!digits) {
+            debug('sendDtmf skipped: no valid DTMF digits after sanitizing button payload')
+            return resolve()
+          }
+          debug(`Sending DTMF digits: ${digits}`)
           const request = JSON.stringify({
             METHOD: 'sendDtmf',
-            digits: msg.buttons[0].payload,
+            digits,
             sessionId: this.sessionId
           })
           this.ws.send(request)
@@ -777,8 +789,17 @@ class BotiumConnectorVoip {
           // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
           const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
           if (dtmfMatch && dtmfMatch[1]) {
-            const digits = dtmfMatch[1]
-            debug(`Sending DTMF from messageText: ${digits}`)
+            const rawDigits = dtmfMatch[1]
+            const digits = sanitizeDtmfDigits(rawDigits)
+            if (!digits) {
+              debug(`sendDtmf skipped: no valid DTMF digits after sanitizing <DTMF> content (raw length=${String(rawDigits).length})`)
+              return resolve()
+            }
+            if (digits !== String(rawDigits).replace(/\s/g, '')) {
+              debug(`Sending DTMF from messageText (sanitized): "${rawDigits}" -> "${digits}"`)
+            } else {
+              debug(`Sending DTMF from messageText: ${digits}`)
+            }
             const request = JSON.stringify({
               METHOD: 'sendDtmf',
               digits,
