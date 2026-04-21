@@ -71,7 +71,8 @@ const Capabilities = {
   VOIP_SILENCE_DURATION_TIMEOUT_START: 'VOIP_SILENCE_DURATION_TIMEOUT_START',
   VOIP_STT_CONFIDENCE_THRESHOLD: 'VOIP_STT_CONFIDENCE_THRESHOLD',
   VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER',
-  VOIP_USER_INPUT_PREFER_VOICE: 'VOIP_USER_INPUT_PREFER_VOICE'
+  VOIP_USER_INPUT_PREFER_VOICE: 'VOIP_USER_INPUT_PREFER_VOICE',
+  VOIP_EMIT_SPECULATIVE_TEXT: 'VOIP_EMIT_SPECULATIVE_TEXT'
 }
 
 const Defaults = {
@@ -118,6 +119,7 @@ class BotiumConnectorVoip {
     // For debugging latency between incoming STT (bot says) and outgoing audio (sendAudio)
     this._lastBotSaysQueuedAt = null
     this._lastBotSaysText = null
+    this._speculativeTurnToken = 0
   }
 
   async Validate () {
@@ -172,8 +174,20 @@ class BotiumConnectorVoip {
     }
 
     const sendBotMsg = (botMsg) => {
-      this._lastBotSaysQueuedAt = Date.now()
+      const queuedAt = Date.now()
+      this._lastBotSaysQueuedAt = queuedAt
       this._lastBotSaysText = botMsg && botMsg.messageText ? String(botMsg.messageText) : null
+      // Stamp the wall-clock instant at which the connector released the bot
+      // utterance to botium-core's queue. Paired with `_receivedAtMs` (last
+      // STT final frame) this gives the true "join silence" the connector
+      // imposed, independent of how long the coach later takes to pick the
+      // message up with WaitBotSays().
+      if (botMsg && botMsg.sourceData) {
+        const head = Array.isArray(botMsg.sourceData) ? botMsg.sourceData[0] : botMsg.sourceData
+        if (head && typeof head === 'object' && !('flushedAtMs' in head)) {
+          head.flushedAtMs = queuedAt
+        }
+      }
       setTimeout(() => this.queueBotSays(botMsg), 0)
     }
 
@@ -195,6 +209,126 @@ class BotiumConnectorVoip {
       }
       return botMsg
     }
+
+    // Arm (or re-arm) the JOIN/PSST silence timer that flushes buffered STT
+    // chunks once the bot has been silent for `joinTimeoutMs`. No-op outside
+    // JOIN/PSST/CONCAT modes (other modes emit finals immediately).
+    const armJoinSilenceTimer = () => {
+      if (!this.botMsgs || this.botMsgs.length === 0) return
+      const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+      const joinLogicHook = this._getJoinLogicHook(this.convoStep)
+      const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || !_.isNil(joinLogicHook)
+      if (!isJoinMethod) return
+      const isPsst = sttHandling === 'PSST'
+      const toJoinTimeoutMs = (ms) => {
+        const parsed = parseInt(ms, 10)
+        if (!_.isFinite(parsed) || parsed <= 0) return null
+        return isPsst ? Math.max(0, parsed - 500) : parsed
+      }
+      let joinTimeoutMs = toJoinTimeoutMs(_.get(joinLogicHook, 'args[0]'))
+      if (!_.isFinite(joinTimeoutMs) || joinTimeoutMs <= 0) {
+        joinTimeoutMs = toJoinTimeoutMs(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+      }
+      if (this.silenceTimeout) {
+        clearTimeout(this.silenceTimeout)
+        this.silenceTimeout = null
+      }
+      const bufferedAtArm = this.botMsgs.length
+      const armedAt = Date.now()
+      _info('psst_timer_armed', {
+        sessionId: this.sessionId,
+        joinTimeoutMs: joinTimeoutMs || 0,
+        bufferedChunks: bufferedAtArm,
+        stopCalled: !!this.stopCalled
+      })
+      this.silenceTimeout = setTimeout(() => {
+        const fireDelay = Date.now() - armedAt
+        if (this.botMsgs.length > 0) {
+          _info('psst_timer_fired', {
+            sessionId: this.sessionId,
+            bufferedChunks: this.botMsgs.length,
+            actualDelayMs: fireDelay,
+            scheduledDelayMs: joinTimeoutMs || 0,
+            outcome: 'emit'
+          })
+          debug('Silence Duration Timeout (JOIN/PSST):', joinTimeoutMs, 'ms')
+          sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
+          this.firstMsg = false
+          this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
+          this.botMsgs = []
+        } else {
+          _info('psst_timer_fired', {
+            sessionId: this.sessionId,
+            bufferedChunks: 0,
+            actualDelayMs: fireDelay,
+            scheduledDelayMs: joinTimeoutMs || 0,
+            outcome: 'noop_empty_buffer'
+          })
+        }
+      }, joinTimeoutMs || 0)
+    }
+
+    // Flush buffered STT chunks on teardown so a late final is not lost when
+    // the PSST silence timer is cleared by Stop(). Falls back to the cached
+    // interim transcript (`lastPartialBotMsg`) when STT never delivered a
+    // final for the closing utterance. Must be called from every terminal
+    // path before `this.end` is flipped.
+    const flushPendingBotMsgs = (reason) => {
+      if (this.silenceTimeout) {
+        _info('psst_timer_cleared', {
+          sessionId: this.sessionId,
+          reason: `flush:${reason}`,
+          bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0
+        })
+        clearTimeout(this.silenceTimeout)
+        this.silenceTimeout = null
+      }
+      if (this.botMsgs && this.botMsgs.length > 0) {
+        const chunkCount = this.botMsgs.length
+        _info('stt_buffer_flushed_on_end', {
+          sessionId: this.sessionId,
+          reason,
+          outcome: 'flushed',
+          chunks: chunkCount
+        })
+        debug(`Flushing ${chunkCount} buffered STT chunk(s) on ${reason}`)
+        sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
+        this.firstMsg = false
+        this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
+        this.botMsgs = []
+        this.lastPartialBotMsg = null
+        return
+      }
+
+      if (this.lastPartialBotMsg && typeof this.lastPartialBotMsg.messageText === 'string' && this.lastPartialBotMsg.messageText.trim().length > 0) {
+        const recovered = this.lastPartialBotMsg
+        const textLen = recovered.messageText.length
+        const preview = recovered.messageText.trim().substring(0, 80)
+        _info('stt_partial_recovery_on_end', {
+          sessionId: this.sessionId,
+          reason,
+          outcome: 'partial_recovery',
+          messageLength: textLen,
+          message: preview
+        })
+        debug(`Recovering last STT partial on ${reason} (no final arrived): "${preview}"`)
+        sendBotMsg(recovered)
+        this.firstMsg = false
+        this.joinLastPrevMsg = recovered
+        this.lastPartialBotMsg = null
+        return
+      }
+
+      _info('stt_flush_noop', {
+        sessionId: this.sessionId,
+        reason,
+        outcome: 'noop',
+        sttPartialCount: this.sttPartialCount || 0
+      })
+      debug(`flushPendingBotMsgs(${reason}): nothing buffered, no partial available (sttPartialCount=${this.sttPartialCount || 0})`)
+    }
+    // Expose on the instance so Stop() (outside this closure) can call it as a final safety net.
+    this._flushPendingBotMsgs = flushPendingBotMsgs
 
     const splitBotMsgs = botMsgs => {
       const splitSentences = s => s.match(new RegExp(`[^${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+[${this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_PUNCTUATION]}]+`, 'g'))
@@ -329,6 +463,8 @@ class BotiumConnectorVoip {
         this.silence = null
         this.msgCount = 0
         this.sttPartialCount = 0
+        // Last interim transcript, used by `flushPendingBotMsgs` when no final arrives.
+        this.lastPartialBotMsg = null
         this.firstMsg = true
         this.firstSttInfoReceived = false
         this.silenceTimeout = null
@@ -391,12 +527,43 @@ class BotiumConnectorVoip {
           }
         })
         this.ws.on('message', async (data) => {
-          const parsedData = JSON.parse(data)
-          // Allow fullRecord delivery even if Stop() was already called.
-          // Otherwise the recording can be dropped if the worker streams it late (common on hangup).
+          // Drop non-JSON gateway frames (rare, but crash the process without this guard).
+          let parsedData
+          try {
+            parsedData = JSON.parse(data)
+            // Earliest local observation of the frame. Consumed downstream
+            // as the "bot finished speaking" anchor for `recordingEpochMs`
+            // (propagates via `sourceData = parsedData` reference).
+            parsedData._receivedAtMs = Date.now()
+          } catch (parseErr) {
+            const rawString = (() => {
+              try {
+                if (Buffer.isBuffer(data)) return data.toString('utf8')
+                if (typeof data === 'string') return data
+                if (data && typeof data.toString === 'function') return data.toString()
+                return '<non-stringable>'
+              } catch (_) { return '<unreadable>' }
+            })()
+            const preview = rawString.length > 200 ? `${rawString.substring(0, 200)}...` : rawString
+            debug(`${this.sessionId} - Ignoring non-JSON WS frame from gateway: ${preview}`)
+            if (typeof _info === 'function') {
+              try {
+                _info('ws_non_json_frame', {
+                  sessionId: this.sessionId,
+                  preview,
+                  byteLength: rawString.length,
+                  parseError: parseErr && parseErr.message ? parseErr.message : String(parseErr)
+                })
+              } catch (_infoErr) { /* structured logger is best-effort */ }
+            }
+            return
+          }
+          // After Stop(), still accept late-arriving recording frames
+          // (fullRecord*) and hard errors so `full_record.wav` is delivered
+          // on early-completion hangups. Post-Stop STT frames remain blocked.
           if (this.stopCalled) {
-            const allowedTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error']
-            if (!parsedData || !parsedData.type || !allowedTypes.includes(parsedData.type)) {
+            const allowedPostStopTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error']
+            if (!parsedData || !allowedPostStopTypes.includes(parsedData.type)) {
               debug(`${this.sessionId} - Stop already called, ignoring incoming message`)
               return
             }
@@ -527,6 +694,7 @@ class BotiumConnectorVoip {
               connectDurationSec: parsedData.connectDuration || null,
               sttPartialCount: this.sttPartialCount
             })
+            flushPendingBotMsgs('callinfo_disconnected')
             const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
             if (parsedData.connectDuration && parsedData.connectDuration > 0) {
               this.eventEmitter.emit('CONSUMPTION_METADATA', this, {
@@ -540,6 +708,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'error') {
+            flushPendingBotMsgs('error')
             this.end = true
             reject(new Error(`Error: ${parsedData.message}`))
             sendBotMsg(new Error(`Error: ${parsedData.message}`))
@@ -560,12 +729,16 @@ class BotiumConnectorVoip {
             const base64Len = (this.fullRecord || tail || '').length
             emitFullRecordAttachment(this.fullRecord || tail)
             _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecordEnd', base64Len })
+            // Flush before `this.end = true` so the buffered final STT is not
+            // dropped when Stop() clears the PSST silence timer on teardown.
+            flushPendingBotMsgs('fullRecordEnd')
             this.end = true
           }
 
           if (parsedData && parsedData.type === 'silence') {
             if (_.isNil(this._getIgnoreSilenceDurationAsserterLogicHook(this.convoStep))) {
               if (_.isNil(this._getJoinLogicHook(this.convoStep)) && parsedData.data.silence.length > 0) {
+                flushPendingBotMsgs('silence_exceeded')
                 this.end = true
                 sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
               }
@@ -577,13 +750,33 @@ class BotiumConnectorVoip {
             const base64 = _extractFullRecordBase64(parsedData)
             emitFullRecordAttachment(base64)
             _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecord', base64Len: (base64 || '').length })
+            flushPendingBotMsgs('fullRecord')
             this.end = true
           }
 
           if (parsedData && parsedData.data && parsedData.data.final === false) {
             this.sttPartialCount++
-            if (this.silenceTimeout) {
+            const partialText = parsedData.data.message
+            if (typeof partialText === 'string' && partialText.trim().length > 0) {
+              this.lastPartialBotMsg = {
+                messageText: partialText,
+                sourceData: Object.assign({}, parsedData, { partialRecovery: true })
+              }
+            }
+            const partialPreview = typeof partialText === 'string' ? partialText.trim().substring(0, 60) : ''
+            _info('stt_partial_received', {
+              sessionId: this.sessionId,
+              partialIndex: this.sttPartialCount,
+              preview: partialPreview,
+              bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0,
+              timerActive: !!this.silenceTimeout
+            })
+            // Partials must not extend the join window when a final is already
+            // buffered; otherwise a trailing stream of partials can strand the
+            // buffered final. Only clear the timer when no finals are waiting.
+            if (this.silenceTimeout && (!this.botMsgs || this.botMsgs.length === 0)) {
               clearTimeout(this.silenceTimeout)
+              this.silenceTimeout = null
             }
             if (_.isNil(this._getIgnoreSilenceDurationAsserterLogicHook(this.convoStep))) {
               if (!this.firstSttInfoReceived && _.isNil(this._getJoinLogicHook(this.convoStep)) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
@@ -632,6 +825,8 @@ class BotiumConnectorVoip {
             const msgText = parsedData.data.message || ''
             const msgLen = typeof msgText === 'string' ? msgText.length : 0
             const msgPreview = typeof msgText === 'string' ? msgText.trim().substring(0, 80) : ''
+            // A final supersedes the cached interim; clear to avoid duplicate tail emission.
+            this.lastPartialBotMsg = null
             debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
             _info('stt_final', {
               sessionId: this.sessionId,
@@ -696,29 +891,33 @@ class BotiumConnectorVoip {
               this.prevData = parsedData
               if (successfulConfidenceScore) {
                 this.botMsgs.push(botMsg)
-                const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-                const isPsst = sttHandling === 'PSST'
-                const toJoinTimeoutMs = (ms) => {
-                  const parsed = parseInt(ms, 10)
-                  if (!_.isFinite(parsed) || parsed <= 0) return null
-                  return isPsst ? Math.max(0, parsed - 500) : parsed
+
+                if (this.caps[Capabilities.VOIP_EMIT_SPECULATIVE_TEXT] && this.eventEmitter) {
+                  const tentative = joinBotMsg(this.botMsgs, this.joinLastPrevMsg)
+                  this._speculativeTurnToken++
+                  // speech{Start,End}Sec are audio-clock offsets (seconds since
+                  // call connect) taken from the STT worker, so downstream
+                  // consumers can align with the recording playhead directly.
+                  const firstChunkStart = _.get(this.botMsgs, '[0].sourceData.data.start', null)
+                  const thisFrameStart = _.get(parsedData, 'data.start', null)
+                  const thisFrameEnd = _.get(parsedData, 'data.end', null)
+                  const speechStartSec = _.isFinite(firstChunkStart)
+                    ? firstChunkStart
+                    : (_.isFinite(thisFrameStart) ? thisFrameStart : null)
+                  const speechEndSec = _.isFinite(thisFrameEnd) ? thisFrameEnd : null
+                  this.eventEmitter.emit('voip.speculativeBotText', {
+                    sessionId: this.sessionId,
+                    messageText: tentative.messageText,
+                    turnToken: this._speculativeTurnToken,
+                    speechStartSec,
+                    speechEndSec
+                  })
                 }
-                const joinLogicHook = this._getJoinLogicHook(this.convoStep)
-                let joinTimeoutMs = toJoinTimeoutMs(_.get(joinLogicHook, 'args[0]'))
-                if (!_.isFinite(joinTimeoutMs) || joinTimeoutMs <= 0) {
-                  joinTimeoutMs = toJoinTimeoutMs(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
-                }
-                this.silenceTimeout = setTimeout(() => {
-                  if (this.botMsgs.length > 0) {
-                    debug('Silence Duration Timeout (JOIN/PSST):', joinTimeoutMs, 'ms')
-                    sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
-                    this.firstMsg = false
-                    this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
-                    this.botMsgs = []
-                  }
-                }, joinTimeoutMs || 0)
+
+                armJoinSilenceTimer()
               }
             }
+
           }
         })
       }).catch(err => {
@@ -772,6 +971,22 @@ class BotiumConnectorVoip {
         const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
         debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
+        // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
+        // the coach can place the agent turn on the recording timeline.
+        // `requestedDurationMs` is the best estimate of on-wire playback
+        // length (DTMF tones × digits, TTS synth output, parsed media duration).
+        const stampAgentWire = (wireKind, requestedDurationMs, extras = {}) => {
+          msg.voipAgent = {
+            wireSentAtMs: Date.now(),
+            inputType,
+            wireKind,
+            requestedDurationMs: Math.max(0, Math.round(requestedDurationMs || 0)),
+            ...extras
+          }
+        }
+        // Twilio default: 100 ms tone + 100 ms gap per digit. Drives agent-bar width only.
+        const DTMF_MS_PER_DIGIT = 200
+
         if (msg && msg.buttons && msg.buttons.length > 0) {
           const digits = sanitizeDtmfDigits(msg.buttons[0].payload)
           if (!digits) {
@@ -784,6 +999,7 @@ class BotiumConnectorVoip {
             digits,
             sessionId: this.sessionId
           })
+          stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
           this.ws.send(request)
         } else if (msg && msg.messageText) {
           // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
@@ -805,6 +1021,7 @@ class BotiumConnectorVoip {
               digits,
               sessionId: this.sessionId
             })
+            stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
             this.ws.send(request)
             return resolve()
           }
@@ -820,8 +1037,11 @@ class BotiumConnectorVoip {
               msg.sourceData = ttsRequest
 
               let ttsResult = null
+              const ttsStartedAt = Date.now()
+              let ttsSynthMs = 0
               try {
                 ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
+                ttsSynthMs = Date.now() - ttsStartedAt
               } catch (err) {
                 return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
               }
@@ -853,6 +1073,10 @@ class BotiumConnectorVoip {
                   mimeType: 'audio/wav',
                   base64: b64Buffer
                 })
+                stampAgentWire('tts', (duration || 0) * 1000, {
+                  ttsSynthMs,
+                  textLength: msg.messageText ? msg.messageText.length : 0
+                })
                 this.ws.send(request)
               } else {
                 return reject(new Error('TTS failed, response is empty'))
@@ -874,6 +1098,8 @@ class BotiumConnectorVoip {
             const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
             debug(`Latency (bot says -> sendAudio/MEDIA): ${latencyMs} ms (last bot: ${botText})`)
           }
+          // Stamp now; `requestedDurationMs` is backfilled once media metadata is parsed.
+          stampAgentWire('media', 0, { mediaUri: msg.media[0].mediaUri || null })
           this.ws.send(request)
           msg.attachments.push({
             name: msg.media[0].mediaUri,
@@ -886,6 +1112,9 @@ class BotiumConnectorVoip {
             if (metadata && metadata.format && metadata.format.duration) {
               debug('Audio duration of user audio:', metadata.format.duration, 'seconds')
               duration = Math.round(metadata.format.duration)
+              if (msg.voipAgent) {
+                msg.voipAgent.requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
+              }
             } else {
               reject(new Error('Could not determine audio duration from metadata'))
             }
@@ -893,7 +1122,11 @@ class BotiumConnectorVoip {
             reject(new Error(`Getting audio duration failed: ${err.message}`))
           }
         }
-        setTimeout(resolve, duration * 1000)
+        const requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
+        if (requestedDurationMs <= 0) {
+          return resolve()
+        }
+        setTimeout(resolve, requestedDurationMs)
       }, 0)
     })
   }
