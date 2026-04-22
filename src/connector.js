@@ -33,6 +33,7 @@ const Capabilities = {
   VOIP_STT_TIMEOUT: 'VOIP_STT_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT',
+  VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT',
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: 'VOIP_STT_MESSAGE_HANDLING_PUNCTUATION',
   VOIP_TTS_URL: 'VOIP_TTS_URL',
@@ -210,6 +211,23 @@ class BotiumConnectorVoip {
       return botMsg
     }
 
+    // Returns true when a partial represents a NEW utterance rather than a tail/echo
+    // of buffered text. Used by PSST partial handler to extend the silence timer.
+    // Heuristic: substring check, then word-overlap fallback (<70% overlap = new).
+    const partialLooksLikeNewUtterance = (partialText, botMsgs) => {
+      const normalize = s => String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim()
+      const partial = normalize(partialText)
+      if (!partial) return false
+      const buffered = normalize((botMsgs || []).map(m => (m && m.messageText) || '').join(' '))
+      if (!buffered) return true
+      if (buffered.includes(partial)) return false
+      const partialWords = partial.split(' ').filter(Boolean)
+      if (partialWords.length === 0) return false
+      const bufferedWords = new Set(buffered.split(' ').filter(Boolean))
+      const overlap = partialWords.filter(w => bufferedWords.has(w)).length
+      return (overlap / partialWords.length) < 0.7
+    }
+
     // Arm (or re-arm) the JOIN/PSST silence timer that flushes buffered STT
     // chunks once the bot has been silent for `joinTimeoutMs`. No-op outside
     // JOIN/PSST/CONCAT modes (other modes emit finals immediately).
@@ -227,7 +245,7 @@ class BotiumConnectorVoip {
       }
       let joinTimeoutMs = toJoinTimeoutMs(_.get(joinLogicHook, 'args[0]'))
       if (!_.isFinite(joinTimeoutMs) || joinTimeoutMs <= 0) {
-        joinTimeoutMs = toJoinTimeoutMs(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+        joinTimeoutMs = toJoinTimeoutMs(this._getEffectiveMessageHandlingTimeout())
       }
       if (this.silenceTimeout) {
         clearTimeout(this.silenceTimeout)
@@ -241,6 +259,21 @@ class BotiumConnectorVoip {
         bufferedChunks: bufferedAtArm,
         stopCalled: !!this.stopCalled
       })
+      // Emit the authoritative join timeout so downstream consumers (e.g.
+      // SpeculationBuffer) can size their quiet threshold relative to it.
+      if (this.eventEmitter && _.isFinite(joinTimeoutMs) && joinTimeoutMs > 0) {
+        try {
+          this.eventEmitter.emit('voip.psstTimerArmed', {
+            sessionId: this.sessionId,
+            joinTimeoutMs,
+            bufferedChunks: bufferedAtArm,
+            armedAt
+          })
+        } catch (emitErr) {
+          // Never block the silence timer on listener errors.
+          debug(`voip.psstTimerArmed emission failed: ${emitErr && emitErr.message}`)
+        }
+      }
       this.silenceTimeout = setTimeout(() => {
         const fireDelay = Date.now() - armedAt
         if (this.botMsgs.length > 0) {
@@ -256,6 +289,9 @@ class BotiumConnectorVoip {
           this.firstMsg = false
           this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
           this.botMsgs = []
+          // Reset partial-driven extension budget for next cycle.
+          this.psstRearmCount = 0
+          this.psstFirstRearmAt = null
         } else {
           _info('psst_timer_fired', {
             sessionId: this.sessionId,
@@ -297,6 +333,8 @@ class BotiumConnectorVoip {
         this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
         this.botMsgs = []
         this.lastPartialBotMsg = null
+        this.psstRearmCount = 0
+        this.psstFirstRearmAt = null
         return
       }
 
@@ -461,9 +499,9 @@ class BotiumConnectorVoip {
               if (joinLogicHook && joinLogicHook.args && joinLogicHook.args.length > 0) {
                 silenceMs = parseInt(joinLogicHook.args[0], 10)
               }
-              // Fallback to global timeout if no per-step hook is set
+              // Fallback to effective timeout (subsequent if past first flush, else global)
               if (!_.isFinite(silenceMs) || silenceMs <= 0) {
-                silenceMs = parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT], 10)
+                silenceMs = parseInt(this._getEffectiveMessageHandlingTimeout(), 10)
               }
               // PSST: treat like JOIN, but subtract 500ms from timeout
               if (_.isFinite(silenceMs) && silenceMs > 0) {
@@ -491,6 +529,10 @@ class BotiumConnectorVoip {
         this.firstMsg = true
         this.firstSttInfoReceived = false
         this.silenceTimeout = null
+        // PSST re-arm tracking: new-utterance partials reset the silence timer,
+        // bounded by MAX_EXTENSION_MS to prevent infinite stranding.
+        this.psstRearmCount = 0
+        this.psstFirstRearmAt = null
 
         this.wsOpened = true
         debug(`Websocket connection to ${wsEndpoint} opened.`)
@@ -794,12 +836,47 @@ class BotiumConnectorVoip {
               bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0,
               timerActive: !!this.silenceTimeout
             })
-            // Partials must not extend the join window when a final is already
-            // buffered; otherwise a trailing stream of partials can strand the
-            // buffered final. Only clear the timer when no finals are waiting.
-            if (this.silenceTimeout && (!this.botMsgs || this.botMsgs.length === 0)) {
-              clearTimeout(this.silenceTimeout)
-              this.silenceTimeout = null
+            // Emit liveness keep-alive so waiters can distinguish "bot silent"
+            // from "bot streaming partials between finals".
+            if (this.caps[Capabilities.VOIP_EMIT_SPECULATIVE_TEXT] && this.eventEmitter && typeof partialText === 'string' && partialText.trim().length > 0) {
+              this.eventEmitter.emit('voip.botActivity', {
+                sessionId: this.sessionId,
+                kind: 'partial',
+                partialIndex: this.sttPartialCount,
+                bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0
+              })
+            }
+            // PSST partial timer logic:
+            //   Empty buffer → clear timer (final will arm fresh).
+            //   Buffered finals + new-utterance partial → re-arm within cap.
+            //   Tail/echo or cap-exceeded partials → ignore (legacy path).
+            if (this.silenceTimeout) {
+              if (!this.botMsgs || this.botMsgs.length === 0) {
+                clearTimeout(this.silenceTimeout)
+                this.silenceTimeout = null
+              } else {
+                const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+                const isPsstMode = sttHandling === 'PSST'
+                if (isPsstMode && typeof partialText === 'string' && partialText.trim().length > 0) {
+                  const MAX_EXTENSION_MS = 60000
+                  const now = Date.now()
+                  const withinCap = this.psstFirstRearmAt == null || (now - this.psstFirstRearmAt) < MAX_EXTENSION_MS
+                  if (withinCap && partialLooksLikeNewUtterance(partialText, this.botMsgs)) {
+                    if (this.psstFirstRearmAt == null) this.psstFirstRearmAt = now
+                    this.psstRearmCount++
+                    _info('psst_timer_extended', {
+                      sessionId: this.sessionId,
+                      rearmCount: this.psstRearmCount,
+                      msSinceFirstRearm: now - this.psstFirstRearmAt,
+                      bufferedChunks: this.botMsgs.length,
+                      reason: 'new_utterance_partial',
+                      partialPreview
+                    })
+                    // armJoinSilenceTimer() handles clearing the existing timeout.
+                    armJoinSilenceTimer()
+                  }
+                }
+              }
             }
             if (_.isNil(this._getIgnoreSilenceDurationAsserterLogicHook(this.convoStep))) {
               if (!this.firstSttInfoReceived && _.isNil(this._getJoinLogicHook(this.convoStep)) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
@@ -827,7 +904,7 @@ class BotiumConnectorVoip {
                     matched = true
                   }
                 } else if (_.isNil(joinLogicHook) && isJoinMethod) {
-                  const joinTimeoutMs = toJoinTimeoutMs(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT])
+                  const joinTimeoutMs = toJoinTimeoutMs(this._getEffectiveMessageHandlingTimeout())
                   if (_.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && silenceDuration > (joinTimeoutMs / 1000)) {
                     matched = true
                   }
@@ -937,6 +1014,9 @@ class BotiumConnectorVoip {
                   })
                 }
 
+                // New final arrived — reset extension budget for next pause.
+                this.psstRearmCount = 0
+                this.psstFirstRearmAt = null
                 armJoinSilenceTimer()
               }
             }
@@ -1376,6 +1456,16 @@ class BotiumConnectorVoip {
       _.get(body, 'awstranscribe.credentials.accessKeyId') ||
       _.get(body, 'azure.credentials.subscriptionKey') ||
       null
+  }
+
+  // After the first flush, use the shorter SUBSEQUENT timeout if configured.
+  // Falls back to the global timeout — fully backward-compatible.
+  _getEffectiveMessageHandlingTimeout () {
+    if (!this.firstMsg) {
+      const sub = parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT], 10)
+      if (_.isFinite(sub) && sub > 0) return sub
+    }
+    return this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_TIMEOUT]
   }
 
   _getJoinLogicHook (convoStep) {
