@@ -222,23 +222,30 @@ class BotiumConnectorVoip {
     let httpInitRetries = 0
     const connectHttp = async (retryIndex) => {
       retryIndex = retryIndex || 0
+      let initCallUrl = ''
       try {
         const workerUrl = this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER]
           ? process.env.BOTIUM_VOIP_WORKER_URL
           : this.caps[Capabilities.VOIP_WORKER_URL].replace('wss', 'https').replace('ws', 'http')
         const baseUrl = workerUrl.endsWith('/') ? workerUrl.slice(0, -1) : workerUrl
+        initCallUrl = `${baseUrl}/initCall`
+        const postPayload = {
+          API_KEY: this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_APIKEY : this.caps[Capabilities.VOIP_WORKER_APIKEY]
+        }
+        const payloadForLog = { ...postPayload, API_KEY: postPayload.API_KEY != null && postPayload.API_KEY !== '' ? '[REDACTED]' : postPayload.API_KEY }
+        debug(`HTTP initCall: POST ${initCallUrl} payload=${JSON.stringify(payloadForLog)}`)
         const res = await axios({
           method: 'post',
-          data: {
-            API_KEY: this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_APIKEY : this.caps[Capabilities.VOIP_WORKER_APIKEY]
-          },
-          url: `${baseUrl}/initCall`
+          data: postPayload,
+          url: initCallUrl
         })
         if (res) {
           data = res.data
           headers = res.headers
+          debug(`HTTP initCall: response status=${res.status} data=${this._getAxiosShortenedOutput(res.data)}`)
         }
       } catch (err) {
+        debug(`HTTP initCall: failed ${initCallUrl} — ${this._getAxiosErrOutput(err)}`)
         debug(`Retry ${retryIndex} / ${this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]}: Connecting to VOIP Worker failed: ${err.message || 'Not reachable'}`)
         if (retryIndex === this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]) {
           throw new Error(`Connecting to VOIP Worker failed: ${err.message || 'Not reachable'}`)
@@ -261,7 +268,15 @@ class BotiumConnectorVoip {
       const connectWs = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
-          if ('set-cookie' in headers) {
+          const useCookie = headers && 'set-cookie' in headers
+          const connectPayload = useCookie
+            ? { withCookie: true, cookieSize: (headers['set-cookie'] && String(headers['set-cookie']).length) || 0 }
+            : { withCookie: false }
+          debug(
+            `WebSocket connect: url=${wsEndpoint} attempt=${retryIndex + 1} max=${this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES] + 1} ` +
+            `options=${JSON.stringify(connectPayload)}`
+          )
+          if (useCookie) {
             this.ws = new WebSocket(wsEndpoint, {
               headers: {
                 Cookie: headers['set-cookie']
@@ -271,9 +286,17 @@ class BotiumConnectorVoip {
             this.ws = new WebSocket(wsEndpoint)
           }
           this.ws.on('open', () => {
+            debug(
+              `WebSocket connect: result=open url=${wsEndpoint} attempt=${retryIndex + 1} ` +
+              `readyState=${this.ws && this.ws.readyState}`
+            )
             resolve(retryIndex)
           })
-          this.ws.on('error', () => {
+          this.ws.on('error', (err) => {
+            debug(
+              `WebSocket connect: result=error url=${wsEndpoint} attempt=${retryIndex + 1} ` +
+              `err=${(err && err.message) || err || 'unknown'}`
+            )
             if (retryIndex === this.caps[Capabilities.VOIP_WEBSOCKET_CONNECT_MAXRETRIES]) {
               reject(new Error(`Websocket connection failed to ${wsEndpoint}`))
             }
