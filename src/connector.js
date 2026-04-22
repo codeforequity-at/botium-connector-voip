@@ -940,7 +940,6 @@ class BotiumConnectorVoip {
                 armJoinSilenceTimer()
               }
             }
-
           }
         })
       }).catch(err => {
