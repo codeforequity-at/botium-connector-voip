@@ -581,6 +581,16 @@ class BotiumConnectorVoip {
           }
         }
 
+        _info('initcall_sent', {
+          sipCallerAddress: request.SIP_CALLER_ADDRESS,
+          sipRegistrarUri: request.SIP_CALLER_REGISTRAR_URI,
+          sipCalleeUri: request.SIP_CALLEE_URI,
+          sipCallerUsername: request.SIP_CALLER_USERNAME,
+          sipProxy: request.SIP_PROXY || null,
+          iceEnable: request.ICE_ENABLE,
+          sttUrl: request.STT_CONFIG && request.STT_CONFIG.stt_url,
+          ttsUrl: request.TTS_CONFIG && request.TTS_CONFIG.tts_url
+        })
         debug(JSON.stringify(request, null, 2))
         this.ws.send(JSON.stringify(request))
 
@@ -741,10 +751,12 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'unauthorized') {
+            _info('callinfo_sip_unauthorized', { sessionId: this.sessionId, event: parsedData.event || null, sipCallerUsername: this.caps[Capabilities.VOIP_SIP_CALLER_USERNAME], sipRegistrarUri: this.caps[Capabilities.VOIP_SIP_CALLER_REGISTRAR_URI] })
             reject(new Error('Error: Cannot open a call: SIP Authorization failed'))
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'forbidden' && parsedData.event === 'onCallRegState') {
+            _info('callinfo_sip_reg_failed', { sessionId: this.sessionId, event: parsedData.event || null, sipCallerAddress: this.caps[Capabilities.VOIP_SIP_CALLER_ADDRESS], sipCallerUsername: this.caps[Capabilities.VOIP_SIP_CALLER_USERNAME], sipRegistrarUri: this.caps[Capabilities.VOIP_SIP_CALLER_REGISTRAR_URI] })
             reject(new Error('Error: Sip Registration failed'))
           }
 
@@ -772,8 +784,13 @@ class BotiumConnectorVoip {
             }
           }
 
+          if (parsedData && parsedData.type === 'callinfo' && !['initialized', 'unauthorized', 'forbidden', 'connected', 'disconnected'].includes(parsedData.status)) {
+            _info('callinfo_unknown_status', { sessionId: this.sessionId, status: parsedData.status || null, event: parsedData.event || null })
+          }
+
           if (parsedData && parsedData.type === 'error') {
             flushPendingBotMsgs('error')
+            _info('ws_error_msg', { sessionId: this.sessionId, message: parsedData.message || null, code: parsedData.code || null })
             this.end = true
             reject(new Error(`Error: ${parsedData.message}`))
             sendBotMsg(new Error(`Error: ${parsedData.message}`))
