@@ -237,7 +237,7 @@ class BotiumConnectorVoip {
       const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
       const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
       if (!isJoinMethod) return
-      const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep)
+      const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep, this.botMsgs)
       if (this.silenceTimeout) {
         clearTimeout(this.silenceTimeout)
         this.silenceTimeout = null
@@ -485,7 +485,7 @@ class BotiumConnectorVoip {
           // For PSST: send join silence duration per step to VOIP worker (controls PSST silence trigger)
           try {
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' && this.ws && this.ws.readyState === WebSocket.OPEN) {
-              const silenceMs = this._getEffectiveJoinTimeoutMs(convoStep)
+              const silenceMs = this._getEffectiveJoinTimeoutMs(convoStep, this.botMsgs)
               if (_.isFinite(silenceMs) && silenceMs > 0 && this.sessionId) {
                 debug(`PSST: sending silenceDurationMs=${silenceMs} for sessionId=${this.sessionId}`)
                 this.ws.send(JSON.stringify({
@@ -888,7 +888,7 @@ class BotiumConnectorVoip {
                 const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST'
                 let matched = false
                 if (isJoinMethod) {
-                  const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep)
+                  const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep, this.botMsgs)
                   if (_.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && silenceDuration > (joinTimeoutMs / 1000)) {
                     matched = true
                   }
@@ -1486,16 +1486,31 @@ class BotiumConnectorVoip {
       .filter(Boolean)
   }
 
-  _getJoinRuleBySubstring (convoStep) {
-    const messageText = _.get(convoStep, 'messageText', '')
-    if (typeof messageText !== 'string' || messageText.length === 0) return null
-    const loweredMessage = messageText.toLowerCase()
+  _getJoinRuleBySubstring (convoStep, botMsgs) {
+    const texts = []
+    const stepMessageText = _.get(convoStep, 'messageText', '')
+    if (typeof stepMessageText === 'string' && stepMessageText.length > 0) {
+      texts.push(stepMessageText)
+    }
+    if (_.isArray(botMsgs) && botMsgs.length > 0) {
+      const bufferedText = botMsgs
+        .map(m => (m && typeof m.messageText === 'string') ? m.messageText : '')
+        .filter(Boolean)
+        .join(' ')
+      if (bufferedText.length > 0) texts.push(bufferedText)
+    }
+    if (texts.length === 0) return null
     const rules = this._normalizeJoinRulesBySubstring()
-    return rules.find(rule => loweredMessage.includes(rule.substring.toLowerCase())) || null
+    for (const text of texts) {
+      const loweredText = text.toLowerCase()
+      const match = rules.find(rule => loweredText.includes(rule.substring.toLowerCase()))
+      if (match) return match
+    }
+    return null
   }
 
   _hasJoinLogicHookOrRule (convoStep) {
-    return !_.isNil(this._getJoinLogicHook(convoStep)) || !_.isNil(this._getJoinRuleBySubstring(convoStep))
+    return !_.isNil(this._getJoinLogicHook(convoStep)) || !_.isNil(this._getJoinRuleBySubstring(convoStep, this.botMsgs))
   }
 
   _toJoinTimeoutMs (ms, isPsst) {
@@ -1504,7 +1519,7 @@ class BotiumConnectorVoip {
     return isPsst ? Math.max(0, parsed - 500) : parsed
   }
 
-  _getEffectiveJoinTimeoutMs (convoStep) {
+  _getEffectiveJoinTimeoutMs (convoStep, botMsgs) {
     const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
     const isPsst = sttHandling === 'PSST'
     const joinLogicHook = this._getJoinLogicHook(convoStep)
@@ -1512,7 +1527,7 @@ class BotiumConnectorVoip {
       const joinHookTimeoutMs = this._toJoinTimeoutMs(joinLogicHook.args[0], isPsst)
       if (_.isFinite(joinHookTimeoutMs) && joinHookTimeoutMs > 0) return joinHookTimeoutMs
     }
-    const joinRule = this._getJoinRuleBySubstring(convoStep)
+    const joinRule = this._getJoinRuleBySubstring(convoStep, botMsgs)
     if (joinRule) {
       const joinRuleTimeoutMs = this._toJoinTimeoutMs(joinRule.timeoutMs, isPsst)
       if (_.isFinite(joinRuleTimeoutMs) && joinRuleTimeoutMs > 0) return joinRuleTimeoutMs
