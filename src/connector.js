@@ -34,6 +34,7 @@ const Capabilities = {
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT',
+  VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING: 'VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING',
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: 'VOIP_STT_MESSAGE_HANDLING_PUNCTUATION',
   VOIP_TTS_URL: 'VOIP_TTS_URL',
@@ -234,19 +235,9 @@ class BotiumConnectorVoip {
     const armJoinSilenceTimer = () => {
       if (!this.botMsgs || this.botMsgs.length === 0) return
       const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-      const joinLogicHook = this._getJoinLogicHook(this.convoStep)
-      const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || !_.isNil(joinLogicHook)
+      const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
       if (!isJoinMethod) return
-      const isPsst = sttHandling === 'PSST'
-      const toJoinTimeoutMs = (ms) => {
-        const parsed = parseInt(ms, 10)
-        if (!_.isFinite(parsed) || parsed <= 0) return null
-        return isPsst ? Math.max(0, parsed - 500) : parsed
-      }
-      let joinTimeoutMs = toJoinTimeoutMs(_.get(joinLogicHook, 'args[0]'))
-      if (!_.isFinite(joinTimeoutMs) || joinTimeoutMs <= 0) {
-        joinTimeoutMs = toJoinTimeoutMs(this._getEffectiveMessageHandlingTimeout())
-      }
+      const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep)
       if (this.silenceTimeout) {
         clearTimeout(this.silenceTimeout)
         this.silenceTimeout = null
@@ -494,19 +485,7 @@ class BotiumConnectorVoip {
           // For PSST: send join silence duration per step to VOIP worker (controls PSST silence trigger)
           try {
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' && this.ws && this.ws.readyState === WebSocket.OPEN) {
-              const joinLogicHook = this._getJoinLogicHook(convoStep)
-              let silenceMs = null
-              if (joinLogicHook && joinLogicHook.args && joinLogicHook.args.length > 0) {
-                silenceMs = parseInt(joinLogicHook.args[0], 10)
-              }
-              // Fallback to effective timeout (subsequent if past first flush, else global)
-              if (!_.isFinite(silenceMs) || silenceMs <= 0) {
-                silenceMs = parseInt(this._getEffectiveMessageHandlingTimeout(), 10)
-              }
-              // PSST: treat like JOIN, but subtract 500ms from timeout
-              if (_.isFinite(silenceMs) && silenceMs > 0) {
-                silenceMs = Math.max(0, silenceMs - 500)
-              }
+              const silenceMs = this._getEffectiveJoinTimeoutMs(convoStep)
               if (_.isFinite(silenceMs) && silenceMs > 0 && this.sessionId) {
                 debug(`PSST: sending silenceDurationMs=${silenceMs} for sessionId=${this.sessionId}`)
                 this.ws.send(JSON.stringify({
@@ -819,7 +798,7 @@ class BotiumConnectorVoip {
 
           if (parsedData && parsedData.type === 'silence') {
             if (_.isNil(this._getIgnoreSilenceDurationAsserterLogicHook(this.convoStep))) {
-              if (_.isNil(this._getJoinLogicHook(this.convoStep)) && parsedData.data.silence.length > 0) {
+              if (!this._hasJoinLogicHookOrRule(this.convoStep) && parsedData.data.silence.length > 0) {
                 flushPendingBotMsgs('silence_exceeded')
                 this.end = true
                 sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
@@ -896,7 +875,7 @@ class BotiumConnectorVoip {
               }
             }
             if (_.isNil(this._getIgnoreSilenceDurationAsserterLogicHook(this.convoStep))) {
-              if (!this.firstSttInfoReceived && _.isNil(this._getJoinLogicHook(this.convoStep)) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
+              if (!this.firstSttInfoReceived && !this._hasJoinLogicHookOrRule(this.convoStep) && this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE] && parsedData.data.start && parsedData.data.start * 1000 > this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START]) {
                 this.end = true
                 sendBotMsg(new Error(`Silence Duration of ${parsedData.data.start}s exceeded Initial Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_START] / 1000}s`))
               }
@@ -905,23 +884,11 @@ class BotiumConnectorVoip {
             if (this.prevData && this.prevData.data && !_.isNil(this.prevData.data.end)) {
               if (!_.isNil(parsedData.data.start)) {
                 const silenceDuration = parsedData.data.start - this.prevData.data.end
-                const joinLogicHook = this._getJoinLogicHook(this.convoStep)
                 const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-                const isPsst = sttHandling === 'PSST'
-                const isJoinMethod = sttHandling === 'JOIN' || isPsst
-                const toJoinTimeoutMs = (ms) => {
-                  const parsed = parseInt(ms, 10)
-                  if (!_.isFinite(parsed) || parsed <= 0) return null
-                  return isPsst ? Math.max(0, parsed - 500) : parsed
-                }
+                const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST'
                 let matched = false
-                if (!_.isNil(joinLogicHook) && isJoinMethod) {
-                  const joinTimeoutMs = toJoinTimeoutMs(joinLogicHook && joinLogicHook.args && joinLogicHook.args[0])
-                  if (_.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && silenceDuration > (joinTimeoutMs / 1000)) {
-                    matched = true
-                  }
-                } else if (_.isNil(joinLogicHook) && isJoinMethod) {
-                  const joinTimeoutMs = toJoinTimeoutMs(this._getEffectiveMessageHandlingTimeout())
+                if (isJoinMethod) {
+                  const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep)
                   if (_.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && silenceDuration > (joinTimeoutMs / 1000)) {
                     matched = true
                   }
@@ -953,10 +920,8 @@ class BotiumConnectorVoip {
               threshold: confidenceThreshold,
               accepted: successfulConfidenceScore
             })
-            // ORIGINAL: emit final message immediately, unless join hooks are active.
-            if (
-              (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL' && (_.isNil(this._getJoinLogicHook(this.convoStep))))
-            ) {
+            // ORIGINAL: always emit final message immediately (ignore JOIN hooks/rules).
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
               let botMsg = { messageText: parsedData.data.message }
               if (this.firstMsg) {
                 const sourceData = parsedData
@@ -1003,7 +968,7 @@ class BotiumConnectorVoip {
               }
               this.botMsgs = []
             }
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT' || (!_.isNil(this._getJoinLogicHook(this.convoStep)))) {
+            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
               const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
               this.prevData = parsedData
               if (successfulConfidenceScore) {
@@ -1489,6 +1454,70 @@ class BotiumConnectorVoip {
     if (_.isNil(convoStep)) return null
     if (_.isNil(convoStep.logicHooks)) return null
     return convoStep && convoStep.logicHooks && convoStep.logicHooks.find(lh => lh.name === 'VOIP_JOIN_SILENCE_DURATION')
+  }
+
+  _normalizeJoinRulesBySubstring () {
+    const rawRules = this.caps[Capabilities.VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING]
+    if (_.isNil(rawRules) || rawRules === '') return []
+    let parsedRules = rawRules
+    if (_.isString(rawRules)) {
+      try {
+        parsedRules = JSON.parse(rawRules)
+      } catch (err) {
+        debug(`Invalid ${Capabilities.VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING} JSON: ${err.message || err}`)
+        return []
+      }
+    }
+    if (!_.isArray(parsedRules)) {
+      debug(`Invalid ${Capabilities.VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING}: expected array`)
+      return []
+    }
+    return parsedRules
+      .map(rule => {
+        if (!rule || typeof rule !== 'object') return null
+        const substring = typeof rule.substring === 'string' ? rule.substring.trim() : ''
+        const timeoutMs = parseInt(rule.timeoutMs, 10)
+        if (!substring || !_.isFinite(timeoutMs) || timeoutMs <= 0) return null
+        return {
+          substring,
+          timeoutMs
+        }
+      })
+      .filter(Boolean)
+  }
+
+  _getJoinRuleBySubstring (convoStep) {
+    const messageText = _.get(convoStep, 'messageText', '')
+    if (typeof messageText !== 'string' || messageText.length === 0) return null
+    const loweredMessage = messageText.toLowerCase()
+    const rules = this._normalizeJoinRulesBySubstring()
+    return rules.find(rule => loweredMessage.includes(rule.substring.toLowerCase())) || null
+  }
+
+  _hasJoinLogicHookOrRule (convoStep) {
+    return !_.isNil(this._getJoinLogicHook(convoStep)) || !_.isNil(this._getJoinRuleBySubstring(convoStep))
+  }
+
+  _toJoinTimeoutMs (ms, isPsst) {
+    const parsed = parseInt(ms, 10)
+    if (!_.isFinite(parsed) || parsed <= 0) return null
+    return isPsst ? Math.max(0, parsed - 500) : parsed
+  }
+
+  _getEffectiveJoinTimeoutMs (convoStep) {
+    const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+    const isPsst = sttHandling === 'PSST'
+    const joinLogicHook = this._getJoinLogicHook(convoStep)
+    if (joinLogicHook && joinLogicHook.args && joinLogicHook.args.length > 0) {
+      const joinHookTimeoutMs = this._toJoinTimeoutMs(joinLogicHook.args[0], isPsst)
+      if (_.isFinite(joinHookTimeoutMs) && joinHookTimeoutMs > 0) return joinHookTimeoutMs
+    }
+    const joinRule = this._getJoinRuleBySubstring(convoStep)
+    if (joinRule) {
+      const joinRuleTimeoutMs = this._toJoinTimeoutMs(joinRule.timeoutMs, isPsst)
+      if (_.isFinite(joinRuleTimeoutMs) && joinRuleTimeoutMs > 0) return joinRuleTimeoutMs
+    }
+    return this._toJoinTimeoutMs(this._getEffectiveMessageHandlingTimeout(), isPsst)
   }
 
   _getIgnoreSilenceDurationAsserterLogicHook (convoStep) {

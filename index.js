@@ -32,6 +32,13 @@ module.exports = {
         type: 'boolean',
         required: false,
         advanced: true
+      },
+      {
+        name: 'VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING',
+        label: 'Join silence timeout rules by bot message substring',
+        type: 'json',
+        required: false,
+        advanced: true
       }
     ]
   },
