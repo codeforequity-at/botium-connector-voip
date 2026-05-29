@@ -1049,6 +1049,7 @@ class BotiumConnectorVoip {
     }
     return new Promise((resolve, reject) => {
       setTimeout(async () => {
+        try {
         let duration = 0
         const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
         const preferVoice = !!preferVoiceCapRaw
@@ -1084,7 +1085,7 @@ class BotiumConnectorVoip {
             sessionId: this.sessionId
           })
           stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
-          this.ws.send(request)
+          this._sendUserSaysWs(request)
         } else if (msg && msg.messageText) {
           // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
           const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
@@ -1106,7 +1107,7 @@ class BotiumConnectorVoip {
               sessionId: this.sessionId
             })
             stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
-            this.ws.send(request)
+            this._sendUserSaysWs(request)
             return resolve()
           }
           if (!skipTtsForMixedInput) {
@@ -1161,7 +1162,7 @@ class BotiumConnectorVoip {
                   ttsSynthMs,
                   textLength: msg.messageText ? msg.messageText.length : 0
                 })
-                this.ws.send(request)
+                this._sendUserSaysWs(request)
               } else {
                 return reject(new Error('TTS failed, response is empty'))
               }
@@ -1184,7 +1185,7 @@ class BotiumConnectorVoip {
           }
           // Stamp now; `requestedDurationMs` is backfilled once media metadata is parsed.
           stampAgentWire('media', 0, { mediaUri: msg.media[0].mediaUri || null })
-          this.ws.send(request)
+          this._sendUserSaysWs(request)
           msg.attachments.push({
             name: msg.media[0].mediaUri,
             mimeType: msg.media[0].mimeType,
@@ -1211,8 +1212,22 @@ class BotiumConnectorVoip {
           return resolve()
         }
         setTimeout(resolve, requestedDurationMs)
+        } catch (err) {
+          reject(err)
+        }
       }, 0)
     })
+  }
+
+  _voipWsCanSend () {
+    return !this.stopCalled && this.ws && this.ws.readyState === WebSocket.OPEN
+  }
+
+  _sendUserSaysWs (request) {
+    if (!this._voipWsCanSend()) {
+      throw new Error('VoIP session stopped')
+    }
+    this.ws.send(request)
   }
 
   async Stop () {
