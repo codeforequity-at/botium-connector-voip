@@ -1050,57 +1050,35 @@ class BotiumConnectorVoip {
     return new Promise((resolve, reject) => {
       setTimeout(async () => {
         try {
-        let duration = 0
-        const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
-        const preferVoice = !!preferVoiceCapRaw
-        const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
-        debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
+          let duration = 0
+          const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
+          const preferVoice = !!preferVoiceCapRaw
+          const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
+          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
-        // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
-        // the coach can place the agent turn on the recording timeline.
-        // `requestedDurationMs` is the best estimate of on-wire playback
-        // length (DTMF tones × digits, TTS synth output, parsed media duration).
-        const stampAgentWire = (wireKind, requestedDurationMs, extras = {}) => {
-          msg.voipAgent = {
-            wireSentAtMs: Date.now(),
-            inputType,
-            wireKind,
-            requestedDurationMs: Math.max(0, Math.round(requestedDurationMs || 0)),
-            ...extras
+          // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
+          // the coach can place the agent turn on the recording timeline.
+          // `requestedDurationMs` is the best estimate of on-wire playback
+          // length (DTMF tones × digits, TTS synth output, parsed media duration).
+          const stampAgentWire = (wireKind, requestedDurationMs, extras = {}) => {
+            msg.voipAgent = {
+              wireSentAtMs: Date.now(),
+              inputType,
+              wireKind,
+              requestedDurationMs: Math.max(0, Math.round(requestedDurationMs || 0)),
+              ...extras
+            }
           }
-        }
-        // Twilio default: 100 ms tone + 100 ms gap per digit. Drives agent-bar width only.
-        const DTMF_MS_PER_DIGIT = 200
+          // Twilio default: 100 ms tone + 100 ms gap per digit. Drives agent-bar width only.
+          const DTMF_MS_PER_DIGIT = 200
 
-        if (msg && msg.buttons && msg.buttons.length > 0) {
-          const digits = sanitizeDtmfDigits(msg.buttons[0].payload)
-          if (!digits) {
-            debug('sendDtmf skipped: no valid DTMF digits after sanitizing button payload')
-            return resolve()
-          }
-          debug(`Sending DTMF digits: ${digits}`)
-          const request = JSON.stringify({
-            METHOD: 'sendDtmf',
-            digits,
-            sessionId: this.sessionId
-          })
-          stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
-          this._sendUserSaysWs(request)
-        } else if (msg && msg.messageText) {
-          // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
-          const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
-          if (dtmfMatch && dtmfMatch[1]) {
-            const rawDigits = dtmfMatch[1]
-            const digits = sanitizeDtmfDigits(rawDigits)
+          if (msg && msg.buttons && msg.buttons.length > 0) {
+            const digits = sanitizeDtmfDigits(msg.buttons[0].payload)
             if (!digits) {
-              debug(`sendDtmf skipped: no valid DTMF digits after sanitizing <DTMF> content (raw length=${String(rawDigits).length})`)
+              debug('sendDtmf skipped: no valid DTMF digits after sanitizing button payload')
               return resolve()
             }
-            if (digits !== String(rawDigits).replace(/\s/g, '')) {
-              debug(`Sending DTMF from messageText (sanitized): "${rawDigits}" -> "${digits}"`)
-            } else {
-              debug(`Sending DTMF from messageText: ${digits}`)
-            }
+            debug(`Sending DTMF digits: ${digits}`)
             const request = JSON.stringify({
               METHOD: 'sendDtmf',
               digits,
@@ -1108,110 +1086,132 @@ class BotiumConnectorVoip {
             })
             stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
             this._sendUserSaysWs(request)
+          } else if (msg && msg.messageText) {
+          // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
+            const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
+            if (dtmfMatch && dtmfMatch[1]) {
+              const rawDigits = dtmfMatch[1]
+              const digits = sanitizeDtmfDigits(rawDigits)
+              if (!digits) {
+                debug(`sendDtmf skipped: no valid DTMF digits after sanitizing <DTMF> content (raw length=${String(rawDigits).length})`)
+                return resolve()
+              }
+              if (digits !== String(rawDigits).replace(/\s/g, '')) {
+                debug(`Sending DTMF from messageText (sanitized): "${rawDigits}" -> "${digits}"`)
+              } else {
+                debug(`Sending DTMF from messageText: ${digits}`)
+              }
+              const request = JSON.stringify({
+                METHOD: 'sendDtmf',
+                digits,
+                sessionId: this.sessionId
+              })
+              stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
+              this._sendUserSaysWs(request)
+              return resolve()
+            }
+            if (!skipTtsForMixedInput) {
+              if (!this.axiosTtsParams) {
+                if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
+                  return reject(new Error('TTS not configured, only audio input supported'))
+                }
+              } else {
+                debug('UserSays routing: executing TTS branch')
+                const ttsRequest = this._buildTtsRequest(msg.messageText)
+                if (!ttsRequest) return reject(new Error('TTS not configured, only audio input supported'))
+                msg.sourceData = ttsRequest
+
+                let ttsResult = null
+                const ttsStartedAt = Date.now()
+                let ttsSynthMs = 0
+                try {
+                  ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
+                  ttsSynthMs = Date.now() - ttsStartedAt
+                } catch (err) {
+                  return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
+                }
+                if (msg && msg.messageText && msg.messageText.length > 0) {
+                  const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
+                  this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
+                    type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
+                    metricName: 'consumption.e2e.voip.tts.characters',
+                    transactions: msg.messageText.length,
+                    apiKey
+                  })
+                }
+                if (ttsResult && Buffer.isBuffer(ttsResult.buffer)) {
+                  duration = parseFloat(ttsResult.duration) || 0
+                  const b64Buffer = ttsResult.buffer.toString('base64')
+                  const request = JSON.stringify({
+                    METHOD: 'sendAudio',
+                    PESQ: false,
+                    sessionId: this.sessionId,
+                    b64_buffer: b64Buffer
+                  })
+                  if (this._lastBotSaysQueuedAt) {
+                    const latencyMs = Date.now() - this._lastBotSaysQueuedAt
+                    const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
+                    debug(`Latency (bot says -> sendAudio/TTS): ${latencyMs} ms (last bot: ${botText})`)
+                  }
+                  msg.attachments.push({
+                    name: 'tts.wav',
+                    mimeType: 'audio/wav',
+                    base64: b64Buffer
+                  })
+                  stampAgentWire('tts', (duration || 0) * 1000, {
+                    ttsSynthMs,
+                    textLength: msg.messageText ? msg.messageText.length : 0
+                  })
+                  this._sendUserSaysWs(request)
+                } else {
+                  return reject(new Error('TTS failed, response is empty'))
+                }
+              }
+            } else {
+              debug('UserSays routing: skipping TTS for mixed input because VOIP_USER_INPUT_PREFER_VOICE is enabled')
+            }
+          }
+          if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
+            debug('UserSays routing: executing MEDIA branch')
+            const request = JSON.stringify({
+              METHOD: 'sendAudio',
+              sessionId: this.sessionId,
+              b64_buffer: msg.media[0].buffer.toString('base64')
+            })
+            if (this._lastBotSaysQueuedAt) {
+              const latencyMs = Date.now() - this._lastBotSaysQueuedAt
+              const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
+              debug(`Latency (bot says -> sendAudio/MEDIA): ${latencyMs} ms (last bot: ${botText})`)
+            }
+            // Stamp now; `requestedDurationMs` is backfilled once media metadata is parsed.
+            stampAgentWire('media', 0, { mediaUri: msg.media[0].mediaUri || null })
+            this._sendUserSaysWs(request)
+            msg.attachments.push({
+              name: msg.media[0].mediaUri,
+              mimeType: msg.media[0].mimeType,
+              base64: msg.media[0].buffer.toString('base64')
+            })
+
+            try {
+              const metadata = await mm.parseBuffer(msg.media[0].buffer)
+              if (metadata && metadata.format && metadata.format.duration) {
+                debug('Audio duration of user audio:', metadata.format.duration, 'seconds')
+                duration = Math.round(metadata.format.duration)
+                if (msg.voipAgent) {
+                  msg.voipAgent.requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
+                }
+              } else {
+                reject(new Error('Could not determine audio duration from metadata'))
+              }
+            } catch (err) {
+              reject(new Error(`Getting audio duration failed: ${err.message}`))
+            }
+          }
+          const requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
+          if (requestedDurationMs <= 0) {
             return resolve()
           }
-          if (!skipTtsForMixedInput) {
-            if (!this.axiosTtsParams) {
-              if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
-                return reject(new Error('TTS not configured, only audio input supported'))
-              }
-            } else {
-              debug('UserSays routing: executing TTS branch')
-              const ttsRequest = this._buildTtsRequest(msg.messageText)
-              if (!ttsRequest) return reject(new Error('TTS not configured, only audio input supported'))
-              msg.sourceData = ttsRequest
-
-              let ttsResult = null
-              const ttsStartedAt = Date.now()
-              let ttsSynthMs = 0
-              try {
-                ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
-                ttsSynthMs = Date.now() - ttsStartedAt
-              } catch (err) {
-                return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
-              }
-              if (msg && msg.messageText && msg.messageText.length > 0) {
-                const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_TTS_BODY))
-                this.eventEmitter.emit('CONSUMPTION_METADATA', this.container, {
-                  type: _.isNil(apiKey) ? 'INBUILT' : 'THIRD_PARTY',
-                  metricName: 'consumption.e2e.voip.tts.characters',
-                  transactions: msg.messageText.length,
-                  apiKey
-                })
-              }
-              if (ttsResult && Buffer.isBuffer(ttsResult.buffer)) {
-                duration = parseFloat(ttsResult.duration) || 0
-                const b64Buffer = ttsResult.buffer.toString('base64')
-                const request = JSON.stringify({
-                  METHOD: 'sendAudio',
-                  PESQ: false,
-                  sessionId: this.sessionId,
-                  b64_buffer: b64Buffer
-                })
-                if (this._lastBotSaysQueuedAt) {
-                  const latencyMs = Date.now() - this._lastBotSaysQueuedAt
-                  const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
-                  debug(`Latency (bot says -> sendAudio/TTS): ${latencyMs} ms (last bot: ${botText})`)
-                }
-                msg.attachments.push({
-                  name: 'tts.wav',
-                  mimeType: 'audio/wav',
-                  base64: b64Buffer
-                })
-                stampAgentWire('tts', (duration || 0) * 1000, {
-                  ttsSynthMs,
-                  textLength: msg.messageText ? msg.messageText.length : 0
-                })
-                this._sendUserSaysWs(request)
-              } else {
-                return reject(new Error('TTS failed, response is empty'))
-              }
-            }
-          } else {
-            debug('UserSays routing: skipping TTS for mixed input because VOIP_USER_INPUT_PREFER_VOICE is enabled')
-          }
-        }
-        if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
-          debug('UserSays routing: executing MEDIA branch')
-          const request = JSON.stringify({
-            METHOD: 'sendAudio',
-            sessionId: this.sessionId,
-            b64_buffer: msg.media[0].buffer.toString('base64')
-          })
-          if (this._lastBotSaysQueuedAt) {
-            const latencyMs = Date.now() - this._lastBotSaysQueuedAt
-            const botText = this._lastBotSaysText ? this._lastBotSaysText.substring(0, 120) : '<unknown>'
-            debug(`Latency (bot says -> sendAudio/MEDIA): ${latencyMs} ms (last bot: ${botText})`)
-          }
-          // Stamp now; `requestedDurationMs` is backfilled once media metadata is parsed.
-          stampAgentWire('media', 0, { mediaUri: msg.media[0].mediaUri || null })
-          this._sendUserSaysWs(request)
-          msg.attachments.push({
-            name: msg.media[0].mediaUri,
-            mimeType: msg.media[0].mimeType,
-            base64: msg.media[0].buffer.toString('base64')
-          })
-
-          try {
-            const metadata = await mm.parseBuffer(msg.media[0].buffer)
-            if (metadata && metadata.format && metadata.format.duration) {
-              debug('Audio duration of user audio:', metadata.format.duration, 'seconds')
-              duration = Math.round(metadata.format.duration)
-              if (msg.voipAgent) {
-                msg.voipAgent.requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
-              }
-            } else {
-              reject(new Error('Could not determine audio duration from metadata'))
-            }
-          } catch (err) {
-            reject(new Error(`Getting audio duration failed: ${err.message}`))
-          }
-        }
-        const requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
-        if (requestedDurationMs <= 0) {
-          return resolve()
-        }
-        setTimeout(resolve, requestedDurationMs)
+          setTimeout(resolve, requestedDurationMs)
         } catch (err) {
           reject(err)
         }
