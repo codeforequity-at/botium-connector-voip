@@ -166,6 +166,7 @@ class BotiumConnectorVoip {
     this.stopCalled = false
 
     this.fullRecord = ''
+    this.fullRecordAttachmentEmitted = false
     this.end = false
     this.connected = false
     this.convoStep = null
@@ -713,6 +714,18 @@ class BotiumConnectorVoip {
                 testSessionJobId: this.caps.VOIP_TEST_SESSION_JOB_ID || null
               }
             })
+            this.fullRecordAttachmentEmitted = true
+          }
+          this._emitBufferedFullRecordIfAny = (reason) => {
+            if (this.fullRecordAttachmentEmitted) return false
+            if (!this.fullRecord || typeof this.fullRecord !== 'string' || this.fullRecord.length === 0) return false
+            emitFullRecordAttachment(this.fullRecord)
+            _info('recording_attached', {
+              sessionId: this.sessionId,
+              source: reason,
+              base64Len: this.fullRecord.length
+            })
+            return true
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'initialized') {
@@ -751,6 +764,9 @@ class BotiumConnectorVoip {
               sttPartialCount: this.sttPartialCount
             })
             flushPendingBotMsgs('callinfo_disconnected')
+            // Some workers may disconnect without sending fullRecordEnd.
+            // If we already buffered full-record chunks, emit them now.
+            this._emitBufferedFullRecordIfAny('callinfo_disconnected_buffered')
             const apiKey = this._extractApiKey(this._getBody(Capabilities.VOIP_STT_BODY))
             if (parsedData.connectDuration && parsedData.connectDuration > 0) {
               this.eventEmitter.emit('CONSUMPTION_METADATA', this, {
@@ -769,6 +785,8 @@ class BotiumConnectorVoip {
 
           if (parsedData && parsedData.type === 'error') {
             flushPendingBotMsgs('error')
+            // Ensure buffered recording is not lost on terminal worker errors.
+            this._emitBufferedFullRecordIfAny('error_buffered')
             _info('ws_error_msg', { sessionId: this.sessionId, message: parsedData.message || null, code: parsedData.code || null })
             this.end = true
             reject(new Error(`Error: ${parsedData.message}`))
@@ -1259,13 +1277,22 @@ class BotiumConnectorVoip {
           }
         }, 100)
       })
+      // Final guard: if worker never emitted fullRecordEnd/fullRecord but
+      // chunks were buffered, publish the attachment before teardown.
+      if (typeof this._emitBufferedFullRecordIfAny === 'function') {
+        this._emitBufferedFullRecordIfAny('stop_final_guard')
+      }
     } else {
       this.wsOpened = false
       this.ws = null
       this.end = false
       this.convoStep = null
       this.firstSttInfoReceived = false
+      if (typeof this._emitBufferedFullRecordIfAny === 'function') {
+        this._emitBufferedFullRecordIfAny('stop_final_guard')
+      }
     }
+    this._emitBufferedFullRecordIfAny = null
   }
 
   _isTtsCacheEnabled () {
