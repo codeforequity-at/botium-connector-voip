@@ -1528,31 +1528,23 @@ class BotiumConnectorVoip {
       .filter(Boolean)
   }
 
-  _getJoinRuleBySubstring (convoStep, botMsgs) {
-    const texts = []
-    const stepMessageText = _.get(convoStep, 'messageText', '')
-    if (typeof stepMessageText === 'string' && stepMessageText.length > 0) {
-      texts.push(stepMessageText)
-    }
-    if (_.isArray(botMsgs) && botMsgs.length > 0) {
-      const bufferedText = botMsgs
-        .map(m => (m && typeof m.messageText === 'string') ? m.messageText : '')
-        .filter(Boolean)
-        .join(' ')
-      if (bufferedText.length > 0) texts.push(bufferedText)
-    }
-    if (texts.length === 0) return null
+  // Matches a substring rule against ONLY the latest buffered STT final chunk.
+  // This keeps the rule's custom timeout in effect for just the one following
+  // final: once a final no longer matches, callers fall back to the default
+  // timeout (the convoStep expected text and the cumulative buffer are
+  // deliberately not considered, so a stale match cannot stick).
+  _getJoinRuleBySubstring (botMsgs) {
+    if (!_.isArray(botMsgs) || botMsgs.length === 0) return null
+    const last = botMsgs[botMsgs.length - 1]
+    const text = (last && typeof last.messageText === 'string') ? last.messageText : ''
+    if (!text) return null
+    const loweredText = text.toLowerCase()
     const rules = this._normalizeJoinRulesBySubstring()
-    for (const text of texts) {
-      const loweredText = text.toLowerCase()
-      const match = rules.find(rule => loweredText.includes(rule.substring.toLowerCase()))
-      if (match) return match
-    }
-    return null
+    return rules.find(rule => loweredText.includes(rule.substring.toLowerCase())) || null
   }
 
   _hasJoinLogicHookOrRule (convoStep) {
-    return !_.isNil(this._getJoinLogicHook(convoStep)) || !_.isNil(this._getJoinRuleBySubstring(convoStep, this.botMsgs))
+    return !_.isNil(this._getJoinLogicHook(convoStep)) || !_.isNil(this._getJoinRuleBySubstring(this.botMsgs))
   }
 
   _toJoinTimeoutMs (ms, isPsst) {
@@ -1569,7 +1561,7 @@ class BotiumConnectorVoip {
       const joinHookTimeoutMs = this._toJoinTimeoutMs(joinLogicHook.args[0], isPsst)
       if (_.isFinite(joinHookTimeoutMs) && joinHookTimeoutMs > 0) return joinHookTimeoutMs
     }
-    const joinRule = this._getJoinRuleBySubstring(convoStep, botMsgs)
+    const joinRule = this._getJoinRuleBySubstring(botMsgs)
     if (joinRule) {
       const joinRuleTimeoutMs = this._toJoinTimeoutMs(joinRule.timeoutMs, isPsst)
       if (_.isFinite(joinRuleTimeoutMs) && joinRuleTimeoutMs > 0) return joinRuleTimeoutMs
