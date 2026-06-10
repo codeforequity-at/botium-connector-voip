@@ -35,6 +35,7 @@ const Capabilities = {
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT',
   VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING: 'VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING',
+  VOIP_STT_DICTIONARY_REPLACEMENTS: 'VOIP_STT_DICTIONARY_REPLACEMENTS',
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: 'VOIP_STT_MESSAGE_HANDLING_PUNCTUATION',
   VOIP_TTS_URL: 'VOIP_TTS_URL',
@@ -840,9 +841,14 @@ class BotiumConnectorVoip {
             this.sttPartialCount++
             const partialText = parsedData.data.message
             if (typeof partialText === 'string' && partialText.trim().length > 0) {
+              const replacementResult = this._applySttDictionaryReplacements(partialText)
               this.lastPartialBotMsg = {
-                messageText: partialText,
-                sourceData: Object.assign({}, parsedData, { partialRecovery: true })
+                messageText: replacementResult.text,
+                sourceData: Object.assign(
+                  {},
+                  this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult),
+                  { partialRecovery: true }
+                )
               }
             }
             const partialPreview = typeof partialText === 'string' ? partialText.trim() : ''
@@ -928,11 +934,13 @@ class BotiumConnectorVoip {
             const confidenceThreshold = ((this._getConfidenceScoreLogicHook(this.convoStep) && this._getConfidenceScoreLogicHook(this.convoStep).args[0]) || this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD])
             const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
             const msgText = parsedData.data.message || ''
+            const replacementResult = this._applySttDictionaryReplacements(msgText)
+            const normalizedMsgText = replacementResult.text
             const msgLen = typeof msgText === 'string' ? msgText.length : 0
-            const msgPreview = typeof msgText === 'string' ? msgText.trim() : ''
+            const msgPreview = typeof normalizedMsgText === 'string' ? normalizedMsgText.trim() : ''
             // A final supersedes the cached interim; clear to avoid duplicate tail emission.
             this.lastPartialBotMsg = null
-            debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
+            debug(`Message: ${normalizedMsgText} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
             _info('stt_final', {
               sessionId: this.sessionId,
               message: msgPreview,
@@ -943,15 +951,15 @@ class BotiumConnectorVoip {
             })
             // ORIGINAL: always emit final message immediately (ignore JOIN hooks/rules).
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
-              let botMsg = { messageText: parsedData.data.message }
+              let botMsg = { messageText: normalizedMsgText }
               if (this.firstMsg) {
-                const sourceData = parsedData
+                const sourceData = this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult)
                 sourceData.silenceDuration = parsedData.data.start
                 sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
                 this.firstMsg = false
               } else {
-                const sourceData = parsedData
+                const sourceData = this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult)
                 const start = _.get(parsedData, 'data.start', null)
                 const prevEnd = _.get(this.prevData, 'data.end', null)
                 sourceData.silenceDuration = (_.isFinite(start) && _.isFinite(prevEnd)) ? (start - prevEnd) : (_.isFinite(start) ? start : null)
@@ -966,15 +974,15 @@ class BotiumConnectorVoip {
               this.botMsgs = []
             }
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'SPLIT' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'EXPAND') {
-              let botMsg = { messageText: parsedData.data.message }
+              let botMsg = { messageText: normalizedMsgText }
               if (this.firstMsg) {
-                const sourceData = parsedData
+                const sourceData = this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult)
                 sourceData.silenceDuration = parsedData.data.start
                 sourceData.voiceDuration = parsedData.data.end - parsedData.data.start
                 botMsg = Object.assign({}, botMsg, { sourceData })
                 this.firstMsg = false
               } else {
-                const sourceData = parsedData
+                const sourceData = this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult)
                 const start = _.get(parsedData, 'data.start', null)
                 const prevEnd = _.get(this.prevData, 'data.end', null)
                 sourceData.silenceDuration = (_.isFinite(start) && _.isFinite(prevEnd)) ? (start - prevEnd) : (_.isFinite(start) ? start : null)
@@ -990,7 +998,10 @@ class BotiumConnectorVoip {
               this.botMsgs = []
             }
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'JOIN' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' || this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'CONCAT') {
-              const botMsg = { messageText: parsedData.data.message, sourceData: parsedData }
+              const botMsg = {
+                messageText: normalizedMsgText,
+                sourceData: this._decorateSourceDataWithSttDictionaryReplacements(parsedData, replacementResult)
+              }
               this.prevData = parsedData
               if (successfulConfidenceScore) {
                 this.botMsgs.push(botMsg)
@@ -1544,6 +1555,74 @@ class BotiumConnectorVoip {
     const loweredText = text.toLowerCase()
     const rules = this._normalizeJoinRulesBySubstring()
     return rules.find(rule => loweredText.includes(rule.substring.toLowerCase())) || null
+  }
+
+  _normalizeSttDictionaryReplacements () {
+    const rawRules = this.caps[Capabilities.VOIP_STT_DICTIONARY_REPLACEMENTS]
+    if (_.isNil(rawRules) || rawRules === '') return []
+    let parsedRules = rawRules
+    if (_.isString(rawRules)) {
+      try {
+        parsedRules = JSON.parse(rawRules)
+      } catch (err) {
+        debug(`Invalid ${Capabilities.VOIP_STT_DICTIONARY_REPLACEMENTS} JSON: ${err.message || err}`)
+        return []
+      }
+    }
+    if (!_.isArray(parsedRules)) {
+      debug(`Invalid ${Capabilities.VOIP_STT_DICTIONARY_REPLACEMENTS}: expected array`)
+      return []
+    }
+    return parsedRules
+      .map(rule => {
+        if (!rule || typeof rule !== 'object') return null
+        const fromValues = _.isArray(rule.from) ? rule.from : [rule.from]
+        const from = _.uniq(fromValues
+          .map(value => value != null ? String(value).trim() : '')
+          .filter(Boolean))
+        const to = rule.to != null ? String(rule.to).trim() : ''
+        if (from.length === 0 || !to) return null
+        return { from, to }
+      })
+      .filter(Boolean)
+  }
+
+  _applySttDictionaryReplacements (text) {
+    if (!_.isString(text) || text.length === 0) return { text, applied: [] }
+    const replacements = this._normalizeSttDictionaryReplacements()
+    if (replacements.length === 0) return { text, applied: [] }
+
+    const replacementsByFrom = new Map()
+    const fromAlternatives = []
+    replacements.forEach(rule => {
+      rule.from.forEach(from => {
+        const fromKey = from.toLowerCase()
+        if (!replacementsByFrom.has(fromKey)) {
+          replacementsByFrom.set(fromKey, rule.to)
+          fromAlternatives.push(from)
+        }
+      })
+    })
+
+    if (fromAlternatives.length === 0) return { text, applied: [] }
+
+    fromAlternatives.sort((a, b) => b.length - a.length)
+    const matcher = new RegExp(fromAlternatives.map(value => _.escapeRegExp(value)).join('|'), 'gi')
+    const applied = []
+    const replacedText = text.replace(matcher, match => {
+      const to = replacementsByFrom.get(match.toLowerCase())
+      applied.push({ from: match, to })
+      return to
+    })
+    return { text: replacedText, applied }
+  }
+
+  _decorateSourceDataWithSttDictionaryReplacements (sourceData, replacementResult) {
+    if (!replacementResult || !_.isArray(replacementResult.applied) || replacementResult.applied.length === 0) return sourceData
+    return Object.assign({}, sourceData, {
+      sttDictionaryOriginalMessage: replacementResult.text === sourceData?.data?.message ? undefined : sourceData?.data?.message,
+      sttDictionaryReplacements: replacementResult.applied
+    })
   }
 
   _hasJoinLogicHookOrRule (convoStep) {

@@ -41,6 +41,13 @@ module.exports = {
         advanced: true
       },
       {
+        name: 'VOIP_STT_DICTIONARY_REPLACEMENTS',
+        label: 'STT dictionary replacements',
+        type: 'json',
+        required: false,
+        advanced: true
+      },
+      {
         name: 'VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE',
         label: 'Enable SDP media type text',
         type: 'boolean',
