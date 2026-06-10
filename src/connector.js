@@ -13,7 +13,7 @@ const mm = require('music-metadata')
 const _info = (event, data) => {
   const parts = Object.entries({ event, ...data })
     .filter(([, v]) => v != null && v !== '')
-    .map(([k, v]) => `${k}=${typeof v === 'string' && v.length > 80 ? `"${v.substring(0, 77)}..."` : JSON.stringify(v)}`)
+    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
   console.info(`[botium-connector-voip] ${parts.join(' ')}`)
 }
 
@@ -74,7 +74,8 @@ const Capabilities = {
   VOIP_STT_CONFIDENCE_THRESHOLD: 'VOIP_STT_CONFIDENCE_THRESHOLD',
   VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER',
   VOIP_USER_INPUT_PREFER_VOICE: 'VOIP_USER_INPUT_PREFER_VOICE',
-  VOIP_EMIT_SPECULATIVE_TEXT: 'VOIP_EMIT_SPECULATIVE_TEXT'
+  VOIP_EMIT_SPECULATIVE_TEXT: 'VOIP_EMIT_SPECULATIVE_TEXT',
+  VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: 'VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE'
 }
 
 const Defaults = {
@@ -98,7 +99,8 @@ const Defaults = {
   VOIP_STT_CONFIDENCE_THRESHOLD: 0.5,
   VOIP_USE_GLOBAL_VOIP_WORKER: false,
   VOIP_SIP_PROTOCOL: 'TCP',
-  VOIP_USER_INPUT_PREFER_VOICE: true
+  VOIP_USER_INPUT_PREFER_VOICE: true,
+  VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: false
 }
 
 const TTS_HTTP_AGENT = new http.Agent({ keepAlive: true })
@@ -548,6 +550,7 @@ class BotiumConnectorVoip {
           ICE_TURN_PASSWORD: this.caps[Capabilities.VOIP_ICE_TURN_PASSWORD],
           ICE_TURN_PROTOCOL: this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
           MIN_SILENCE_DURATION: this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_ENABLE] ? this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] : null,
+          SDP_MEDIA_TYPE_TEXT_ENABLE: !!this.caps[Capabilities.VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE],
           STT_LEGACY: sttLegacy,
           STT_CONFIG: {
             stt_url: sttUrl,
@@ -842,7 +845,7 @@ class BotiumConnectorVoip {
                 sourceData: Object.assign({}, parsedData, { partialRecovery: true })
               }
             }
-            const partialPreview = typeof partialText === 'string' ? partialText.trim().substring(0, 60) : ''
+            const partialPreview = typeof partialText === 'string' ? partialText.trim() : ''
             _info('stt_partial_received', {
               sessionId: this.sessionId,
               partialIndex: this.sttPartialCount,
@@ -926,7 +929,7 @@ class BotiumConnectorVoip {
             const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
             const msgText = parsedData.data.message || ''
             const msgLen = typeof msgText === 'string' ? msgText.length : 0
-            const msgPreview = typeof msgText === 'string' ? msgText.trim().substring(0, 80) : ''
+            const msgPreview = typeof msgText === 'string' ? msgText.trim() : ''
             // A final supersedes the cached interim; clear to avoid duplicate tail emission.
             this.lastPartialBotMsg = null
             debug(`Message: ${parsedData.data.message} / Confidence Score: ${this._getConfidenceScore(parsedData)} (Threshold: ${confidenceThreshold})`)
