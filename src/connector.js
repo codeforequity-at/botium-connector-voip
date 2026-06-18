@@ -1005,12 +1005,19 @@ class BotiumConnectorVoip {
                     ? firstChunkStart
                     : (_.isFinite(thisFrameStart) ? thisFrameStart : null)
                   const speechEndSec = _.isFinite(thisFrameEnd) ? thisFrameEnd : null
+                  // speechFrameStartSec is the audio-clock start of THIS stt_final
+                  // frame (not the turn). speechStartSec stays the first-chunk
+                  // (turn) start for backward compatibility; consumers that want
+                  // per-fragment inter-arrival gaps (PSST calibration) use the
+                  // frame start. Additive field — existing consumers ignore it.
+                  const speechFrameStartSec = _.isFinite(thisFrameStart) ? thisFrameStart : null
                   this.eventEmitter.emit('voip.speculativeBotText', {
                     sessionId: this.sessionId,
                     messageText: tentative.messageText,
                     turnToken: this._speculativeTurnToken,
                     speechStartSec,
-                    speechEndSec
+                    speechEndSec,
+                    speechFrameStartSec
                   })
                 }
 
