@@ -183,6 +183,7 @@ class BotiumConnectorVoip {
     this._lastBotSaysText = null
     this.audioStream = { format: null, pcmParts: [], totalBytes: 0, complete: false }
     this._turnAudioCounter = 0
+    this._lastBotTurnStartSec = null
     if (this.ttsCache) {
       this.ttsCache.clear()
     }
@@ -202,35 +203,23 @@ class BotiumConnectorVoip {
           head.flushedAtMs = queuedAt
         }
       }
-      // Attach per-turn audio slice when VOIP_TURN_AUDIO_ENABLE is set and the
-      // audio stream has been buffered. Runs synchronously so the attachment is
-      // present when botium-core copies attachments into the transcript step.
+      // A turn = bot speaks first, then me responds.
+      // Save the bot's audio start so UserSays can slice the full exchange
+      // (bot + me) once me has finished speaking.
       if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && botMsg && !(botMsg instanceof Error)) {
         try {
           const sd = botMsg.sourceData
           let startSec = null
-          let endSec = null
           if (Array.isArray(sd) && sd.length > 0) {
             startSec = _.get(sd, '[0].data.start', null)
-            endSec = _.get(sd, `[${sd.length - 1}].data.end`, null)
           } else if (sd && typeof sd === 'object') {
             startSec = _.get(sd, 'data.start', null)
-            endSec = _.get(sd, 'data.end', null)
           }
-          if (_.isFinite(startSec) && _.isFinite(endSec)) {
-            const audioBase64 = this._sliceTurnAudio(startSec, endSec)
-            if (audioBase64) {
-              this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
-              if (!botMsg.attachments) botMsg.attachments = []
-              botMsg.attachments.push({
-                name: `turn_${this._turnAudioCounter}_bot.wav`,
-                mimeType: 'audio/wav',
-                base64: audioBase64,
-              })
-            }
+          if (_.isFinite(startSec)) {
+            this._lastBotTurnStartSec = startSec
           }
-        } catch (audioErr) {
-          debug(`${this.sessionId} - sendBotMsg: turn audio slice error: ${audioErr && audioErr.message}`)
+        } catch (err) {
+          debug(`${this.sessionId} - sendBotMsg: saving turn start error: ${err && err.message}`)
         }
       }
       setTimeout(() => this.queueBotSays(botMsg), 0)
@@ -1314,10 +1303,40 @@ class BotiumConnectorVoip {
             }
           }
           const requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
-          if (requestedDurationMs <= 0) {
-            return resolve()
+
+          // After the TTS/media finishes playing, slice the full turn audio
+          // (bot spoke first + me just finished) and attach it to this me-step.
+          const attachTurnAudioAndResolve = () => {
+            if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && _.isFinite(this._lastBotTurnStartSec)) {
+              try {
+                const fmt = this.audioStream && this.audioStream.format
+                const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
+                const endSec = (bytesPerSec && this.audioStream.totalBytes > 0)
+                  ? this.audioStream.totalBytes / bytesPerSec
+                  : null
+                if (_.isFinite(endSec) && endSec > this._lastBotTurnStartSec) {
+                  const audioBase64 = this._sliceTurnAudio(this._lastBotTurnStartSec, endSec)
+                  if (audioBase64) {
+                    this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
+                    msg.attachments.push({
+                      name: `turn_${this._turnAudioCounter}.wav`,
+                      mimeType: 'audio/wav',
+                      base64: audioBase64,
+                    })
+                  }
+                }
+              } catch (err) {
+                debug(`UserSays: turn audio slice error: ${err && err.message}`)
+              }
+              this._lastBotTurnStartSec = null
+            }
+            resolve()
           }
-          setTimeout(resolve, requestedDurationMs)
+
+          if (requestedDurationMs <= 0) {
+            return attachTurnAudioAndResolve()
+          }
+          setTimeout(attachTurnAudioAndResolve, requestedDurationMs)
         } catch (err) {
           reject(err)
         }
