@@ -53,6 +53,27 @@ module.exports = {
         type: 'boolean',
         required: false,
         advanced: true
+      },
+      {
+        name: 'VOIP_TURN_AUDIO_ENABLE',
+        label: 'Attach per-turn audio to each transcript message',
+        type: 'boolean',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_TURN_AUDIO_PADDING_MS',
+        label: 'Extra milliseconds appended after each turn audio slice (absorbs STT boundary jitter)',
+        type: 'int',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_TURN_AUDIO_OFFSET_MS',
+        label: 'Millisecond offset applied to every turn audio start time (positive = shift right)',
+        type: 'int',
+        required: false,
+        advanced: true
       }
     ]
   },

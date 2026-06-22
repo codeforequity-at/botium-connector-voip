@@ -76,7 +76,10 @@ const Capabilities = {
   VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER',
   VOIP_USER_INPUT_PREFER_VOICE: 'VOIP_USER_INPUT_PREFER_VOICE',
   VOIP_EMIT_SPECULATIVE_TEXT: 'VOIP_EMIT_SPECULATIVE_TEXT',
-  VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: 'VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE'
+  VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: 'VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE',
+  VOIP_TURN_AUDIO_ENABLE: 'VOIP_TURN_AUDIO_ENABLE',
+  VOIP_TURN_AUDIO_PADDING_MS: 'VOIP_TURN_AUDIO_PADDING_MS',
+  VOIP_TURN_AUDIO_OFFSET_MS: 'VOIP_TURN_AUDIO_OFFSET_MS'
 }
 
 const Defaults = {
@@ -101,7 +104,10 @@ const Defaults = {
   VOIP_USE_GLOBAL_VOIP_WORKER: false,
   VOIP_SIP_PROTOCOL: 'TCP',
   VOIP_USER_INPUT_PREFER_VOICE: true,
-  VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: false
+  VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: false,
+  VOIP_TURN_AUDIO_ENABLE: false,
+  VOIP_TURN_AUDIO_PADDING_MS: 150,
+  VOIP_TURN_AUDIO_OFFSET_MS: 0
 }
 
 const TTS_HTTP_AGENT = new http.Agent({ keepAlive: true })
@@ -175,6 +181,8 @@ class BotiumConnectorVoip {
     this.convoStep = null
     this._lastBotSaysQueuedAt = null
     this._lastBotSaysText = null
+    this.audioStream = { format: null, pcmParts: [], totalBytes: 0, complete: false }
+    this._turnAudioCounter = 0
     if (this.ttsCache) {
       this.ttsCache.clear()
     }
@@ -192,6 +200,37 @@ class BotiumConnectorVoip {
         const head = Array.isArray(botMsg.sourceData) ? botMsg.sourceData[0] : botMsg.sourceData
         if (head && typeof head === 'object' && !('flushedAtMs' in head)) {
           head.flushedAtMs = queuedAt
+        }
+      }
+      // Attach per-turn audio slice when VOIP_TURN_AUDIO_ENABLE is set and the
+      // audio stream has been buffered. Runs synchronously so the attachment is
+      // present when botium-core copies attachments into the transcript step.
+      if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && botMsg && !(botMsg instanceof Error)) {
+        try {
+          const sd = botMsg.sourceData
+          let startSec = null
+          let endSec = null
+          if (Array.isArray(sd) && sd.length > 0) {
+            startSec = _.get(sd, '[0].data.start', null)
+            endSec = _.get(sd, `[${sd.length - 1}].data.end`, null)
+          } else if (sd && typeof sd === 'object') {
+            startSec = _.get(sd, 'data.start', null)
+            endSec = _.get(sd, 'data.end', null)
+          }
+          if (_.isFinite(startSec) && _.isFinite(endSec)) {
+            const audioBase64 = this._sliceTurnAudio(startSec, endSec)
+            if (audioBase64) {
+              this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
+              if (!botMsg.attachments) botMsg.attachments = []
+              botMsg.attachments.push({
+                name: `turn_${this._turnAudioCounter}_bot.wav`,
+                mimeType: 'audio/wav',
+                base64: audioBase64,
+              })
+            }
+          }
+        } catch (audioErr) {
+          debug(`${this.sessionId} - sendBotMsg: turn audio slice error: ${audioErr && audioErr.message}`)
         }
       }
       setTimeout(() => this.queueBotSays(botMsg), 0)
@@ -552,6 +591,7 @@ class BotiumConnectorVoip {
           ICE_TURN_PROTOCOL: this.caps[Capabilities.VOIP_ICE_TURN_PROTOCOL] || 'TCP',
           MIN_SILENCE_DURATION: this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_ENABLE] ? this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] : null,
           SDP_MEDIA_TYPE_TEXT_ENABLE: !!this.caps[Capabilities.VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE],
+          AUDIO_STREAM: !!this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE],
           STT_LEGACY: sttLegacy,
           STT_CONFIG: {
             stt_url: sttUrl,
@@ -621,7 +661,7 @@ class BotiumConnectorVoip {
           // (fullRecord*) and hard errors so `full_record.wav` is delivered
           // on early-completion hangups. Post-Stop STT frames remain blocked.
           if (this.stopCalled) {
-            const allowedPostStopTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error']
+            const allowedPostStopTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error', 'audioStreamStart', 'audioStreamChunk', 'audioStreamEnd']
             if (!parsedData || !allowedPostStopTypes.includes(parsedData.type)) {
               debug(`${this.sessionId} - Stop already called, ignoring incoming message`)
               return
@@ -795,6 +835,40 @@ class BotiumConnectorVoip {
             this.end = true
             reject(new Error(`Error: ${parsedData.message}`))
             sendBotMsg(new Error(`Error: ${parsedData.message}`))
+          }
+
+          // Per-turn audio stream: continuous PCM chunks received during the call.
+          // The connector buffers them so _sliceTurnAudio() can extract per-turn segments.
+          if (parsedData && parsedData.type === 'audioStreamStart') {
+            this.audioStream = {
+              format: {
+                sampleRate: parsedData.sampleRate,
+                channels: parsedData.channels,
+                bitsPerSample: parsedData.bitsPerSample,
+                dataOffset: parsedData.dataOffset,
+              },
+              pcmParts: [],
+              totalBytes: 0,
+              complete: false,
+            }
+            debug(`${this.sessionId} - audioStreamStart sampleRate=${parsedData.sampleRate} channels=${parsedData.channels} bitsPerSample=${parsedData.bitsPerSample}`)
+          }
+          if (parsedData && parsedData.type === 'audioStreamChunk') {
+            if (this.audioStream && parsedData.chunk) {
+              try {
+                const buf = Buffer.from(parsedData.chunk, 'base64')
+                this.audioStream.pcmParts.push(buf)
+                this.audioStream.totalBytes += buf.length
+              } catch (e) {
+                debug(`${this.sessionId} - audioStreamChunk decode error: ${e && e.message}`)
+              }
+            }
+          }
+          if (parsedData && parsedData.type === 'audioStreamEnd') {
+            if (this.audioStream) {
+              this.audioStream.complete = true
+            }
+            debug(`${this.sessionId} - audioStreamEnd totalBytes=${parsedData.totalBytes}`)
           }
 
           // Full record streaming support:
@@ -1672,6 +1746,94 @@ class BotiumConnectorVoip {
       }
     }
     return null
+  }
+
+  /**
+   * Build a well-formed WAV Buffer from raw PCM bytes and a format descriptor.
+   * @param {Buffer} pcm   raw PCM bytes (no header)
+   * @param {{ sampleRate: number, channels: number, bitsPerSample: number }} fmt
+   * @returns {Buffer}
+   */
+  _buildWavBuffer (pcm, fmt) {
+    const { sampleRate, channels, bitsPerSample } = fmt
+    const byteRate = sampleRate * channels * (bitsPerSample / 8)
+    const blockAlign = channels * (bitsPerSample / 8)
+    const dataSize = pcm.length
+    const header = Buffer.alloc(44)
+    header.write('RIFF', 0)
+    header.writeUInt32LE(36 + dataSize, 4)
+    header.write('WAVE', 8)
+    header.write('fmt ', 12)
+    header.writeUInt32LE(16, 16)          // fmt chunk size
+    header.writeUInt16LE(1, 20)           // PCM format
+    header.writeUInt16LE(channels, 22)
+    header.writeUInt32LE(sampleRate, 24)
+    header.writeUInt32LE(byteRate, 28)
+    header.writeUInt16LE(blockAlign, 32)
+    header.writeUInt16LE(bitsPerSample, 34)
+    header.write('data', 36)
+    header.writeUInt32LE(dataSize, 40)
+    return Buffer.concat([header, pcm])
+  }
+
+  /**
+   * Slice a segment of the continuously buffered PCM audio stream and return
+   * it as a base64-encoded WAV string.
+   *
+   * @param {number} startSec  start of the segment (seconds from call connect)
+   * @param {number} endSec    end of the segment (seconds from call connect)
+   * @returns {string|null}    base64 WAV or null if the stream is not ready
+   */
+  _sliceTurnAudio (startSec, endSec) {
+    const stream = this.audioStream
+    if (!stream || !stream.format || !stream.pcmParts || !stream.pcmParts.length) return null
+    if (!_.isFinite(startSec) || !_.isFinite(endSec) || endSec <= startSec) return null
+
+    const { sampleRate, channels, bitsPerSample } = stream.format
+    const bytesPerSec = sampleRate * channels * (bitsPerSample / 8)
+    const frameBytes = channels * (bitsPerSample / 8)
+
+    const offsetSec = (this.caps[Capabilities.VOIP_TURN_AUDIO_OFFSET_MS] || 0) / 1000
+    const paddingSec = (this.caps[Capabilities.VOIP_TURN_AUDIO_PADDING_MS] || 0) / 1000
+
+    const adjStart = Math.max(0, startSec + offsetSec)
+    const adjEnd = endSec + paddingSec
+
+    // Frame-align the byte boundaries.
+    const startByte = Math.floor(adjStart * bytesPerSec / frameBytes) * frameBytes
+    const endByte = Math.ceil(adjEnd * bytesPerSec / frameBytes) * frameBytes
+
+    if (startByte >= stream.totalBytes) {
+      debug(`${this.sessionId} - _sliceTurnAudio: startByte ${startByte} >= totalBytes ${stream.totalBytes}, skipping`)
+      return null
+    }
+
+    const clampedEnd = Math.min(endByte, stream.totalBytes)
+    const sliceLen = clampedEnd - startByte
+    if (sliceLen <= 0) return null
+
+    // Materialise only the bytes we need from the part list.
+    const pcm = Buffer.allocUnsafe(sliceLen)
+    let written = 0
+    let offset = 0
+    for (const part of stream.pcmParts) {
+      const partEnd = offset + part.length
+      if (partEnd <= startByte) {
+        offset += part.length
+        continue
+      }
+      if (offset >= clampedEnd) break
+      const copyFrom = Math.max(0, startByte - offset)
+      const copyTo = Math.min(part.length, clampedEnd - offset)
+      part.copy(pcm, written, copyFrom, copyTo)
+      written += copyTo - copyFrom
+      offset += part.length
+    }
+
+    if (written === 0) return null
+    const slicedPcm = written < sliceLen ? pcm.slice(0, written) : pcm
+    const wavBuf = this._buildWavBuffer(slicedPcm, { sampleRate, channels, bitsPerSample })
+    return wavBuf.toString('base64')
   }
 }
 
