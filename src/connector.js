@@ -105,7 +105,7 @@ const Defaults = {
   VOIP_SIP_PROTOCOL: 'TCP',
   VOIP_USER_INPUT_PREFER_VOICE: true,
   VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: false,
-  VOIP_TURN_AUDIO_ENABLE: false,
+  VOIP_TURN_AUDIO_ENABLE: true,
   VOIP_TURN_AUDIO_PADDING_MS: 150,
   VOIP_TURN_AUDIO_OFFSET_MS: 0
 }
@@ -215,7 +215,9 @@ class BotiumConnectorVoip {
           } else if (sd && typeof sd === 'object') {
             startSec = _.get(sd, 'data.start', null)
           }
-          if (_.isFinite(startSec)) {
+          // Only record the FIRST bot message's start; if several bot messages
+          // arrive before the next UserSays they all belong to the same turn.
+          if (_.isFinite(startSec) && this._lastBotTurnStartSec === null) {
             this._lastBotTurnStartSec = startSec
           }
         } catch (err) {
