@@ -10,6 +10,12 @@ const mm = require('music-metadata')
 // debug = high-frequency diagnostics (DEBUG=botium-connector-voip). warn = degraded but continuing.
 // error = abort/failure. No secrets in info; STT text only as length or truncated in info.
 
+/** WS frame types logged only at start/end handlers — not per-chunk (hundreds per call). */
+const WS_DEBUG_SILENT_TYPES = new Set(['audioStreamChunk', 'fullRecordChunk'])
+const WS_DEBUG_BASE64_FIELD_NAMES = new Set([
+  'chunk', 'buffer', 'base64', 'fullRecord', 'full_record', 'audio', 'audioData', 'b64_buffer'
+])
+
 const _info = (event, data) => {
   const parts = Object.entries({ event, ...data })
     .filter(([, v]) => v != null && v !== '')
@@ -665,7 +671,8 @@ class BotiumConnectorVoip {
             if (!obj || typeof obj !== 'object') return
             for (const key of Object.keys(obj)) {
               const val = obj[key]
-              if (typeof val === 'string' && val.length > 500) {
+              if (typeof val === 'string' && val.length > 0 &&
+                  (WS_DEBUG_BASE64_FIELD_NAMES.has(key) || val.length > 500)) {
                 obj[key] = `<base64:${val.length}chars>`
               } else if (val && typeof val === 'object' && !Array.isArray(val)) {
                 sanitizeBase64Fields(val, `${prefix}${key}.`)
@@ -674,7 +681,9 @@ class BotiumConnectorVoip {
           }
           sanitizeBase64Fields(parsedDataLog)
 
-          debug(JSON.stringify(parsedDataLog, null, 2))
+          if (!WS_DEBUG_SILENT_TYPES.has(parsedData?.type)) {
+            debug(JSON.stringify(parsedDataLog, null, 2))
+          }
 
           const _extractFullRecordBase64 = (pd) => {
             if (!pd) return null
