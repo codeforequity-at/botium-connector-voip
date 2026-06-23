@@ -1192,6 +1192,9 @@ class BotiumConnectorVoip {
             })
             stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
             this._sendUserSaysWs(request)
+            // Wait for the DTMF tones to be played/recorded before slicing the
+            // turn audio, so the tones are included in the per-turn segment.
+            duration = (digits.length * DTMF_MS_PER_DIGIT) / 1000
           } else if (msg && msg.messageText) {
           // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
             const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
@@ -1214,9 +1217,10 @@ class BotiumConnectorVoip {
               })
               stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
               this._sendUserSaysWs(request)
-              return resolve()
-            }
-            if (!skipTtsForMixedInput) {
+              // Wait for the DTMF tones to be played/recorded before slicing the
+              // turn audio, so the tones are included in the per-turn segment.
+              duration = (digits.length * DTMF_MS_PER_DIGIT) / 1000
+            } else if (!skipTtsForMixedInput) {
               if (!this.axiosTtsParams) {
                 if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
                   return reject(new Error('TTS not configured, only audio input supported'))
