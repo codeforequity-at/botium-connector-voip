@@ -1166,12 +1166,20 @@ class BotiumConnectorVoip {
           // the coach can place the agent turn on the recording timeline.
           // `requestedDurationMs` is the best estimate of on-wire playback
           // length (DTMF tones × digits, TTS synth output, parsed media duration).
+          const recordingSecNow = () => {
+            const fmt = this.audioStream && this.audioStream.format
+            const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
+            if (!bytesPerSec || !this.audioStream || !(this.audioStream.totalBytes > 0)) return null
+            return this.audioStream.totalBytes / bytesPerSec
+          }
           const stampAgentWire = (wireKind, requestedDurationMs, extras = {}) => {
+            const wireRecordingStartSec = recordingSecNow()
             msg.voipAgent = {
               wireSentAtMs: Date.now(),
               inputType,
               wireKind,
               requestedDurationMs: Math.max(0, Math.round(requestedDurationMs || 0)),
+              ...(wireRecordingStartSec != null ? { wireRecordingStartSec } : {}),
               ...extras
             }
           }
@@ -1322,28 +1330,34 @@ class BotiumConnectorVoip {
           // After the TTS/media finishes playing, slice the full turn audio
           // (bot spoke first + me just finished) and attach it to this me-step.
           const attachTurnAudioAndResolve = () => {
-            if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && _.isFinite(this._lastBotTurnStartSec)) {
-              try {
-                const fmt = this.audioStream && this.audioStream.format
-                const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
-                const endSec = (bytesPerSec && this.audioStream.totalBytes > 0)
-                  ? this.audioStream.totalBytes / bytesPerSec
-                  : null
-                if (_.isFinite(endSec) && endSec > this._lastBotTurnStartSec) {
-                  const audioBase64 = this._sliceTurnAudio(this._lastBotTurnStartSec, endSec)
-                  if (audioBase64) {
-                    this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
-                    msg.attachments.push({
-                      name: `turn_${this._turnAudioCounter}.wav`,
-                      mimeType: 'audio/wav',
-                      base64: audioBase64,
-                    })
-                  }
-                }
-              } catch (err) {
-                debug(`UserSays: turn audio slice error: ${err && err.message}`)
+            try {
+              const fmt = this.audioStream && this.audioStream.format
+              const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
+              const endSec = (bytesPerSec && this.audioStream && this.audioStream.totalBytes > 0)
+                ? this.audioStream.totalBytes / bytesPerSec
+                : null
+              if (msg.voipAgent && _.isFinite(endSec) && requestedDurationMs > 0) {
+                const requestedSec = requestedDurationMs / 1000
+                const fromEnd = Math.max(0, endSec - requestedSec)
+                const wireSec = msg.voipAgent.wireRecordingStartSec
+                msg.voipAgent.heardRecordingStartSec = _.isFinite(wireSec)
+                  ? Math.max(wireSec, fromEnd)
+                  : fromEnd
               }
-              this._lastBotTurnStartSec = null
+              if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && _.isFinite(this._lastBotTurnStartSec) && _.isFinite(endSec) && endSec > this._lastBotTurnStartSec) {
+                const audioBase64 = this._sliceTurnAudio(this._lastBotTurnStartSec, endSec)
+                if (audioBase64) {
+                  this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
+                  msg.attachments.push({
+                    name: `turn_${this._turnAudioCounter}.wav`,
+                    mimeType: 'audio/wav',
+                    base64: audioBase64,
+                  })
+                }
+                this._lastBotTurnStartSec = null
+              }
+            } catch (err) {
+              debug(`UserSays: turn audio slice error: ${err && err.message}`)
             }
             resolve()
           }
