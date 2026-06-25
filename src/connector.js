@@ -12,6 +12,9 @@ const mm = require('music-metadata')
 
 /** WS frame types logged only at start/end handlers — not per-chunk (hundreds per call). */
 const WS_DEBUG_SILENT_TYPES = new Set(['audioStreamChunk', 'fullRecordChunk'])
+const AGENT_SPEECH_RMS_WINDOW_MS = 100
+const DEFAULT_AGENT_SPEECH_RMS_THRESHOLD = 500
+const DEFAULT_AGENT_SPEECH_SUSTAINED_WINDOWS = 2
 const WS_DEBUG_BASE64_FIELD_NAMES = new Set([
   'chunk', 'buffer', 'base64', 'fullRecord', 'full_record', 'audio', 'audioData', 'b64_buffer'
 ])
@@ -29,12 +32,36 @@ const sanitizeDtmfDigits = (raw) => {
   return String(raw).replace(/[^0-9*#ABCDabcd]/g, '').toUpperCase()
 }
 
+// Matches voipcall.generate_dtmf_sequence defaults (100 ms tone, 50 ms pause between digits).
+const DTMF_TONE_MS = 100
+const DTMF_PAUSE_MS = 50
+const DTMF_MS_PER_DIGIT = 200
+const DEFAULT_AUDIO_STREAM_INTERVAL_MS = 250
+
+const audioStreamIntervalMs = () => {
+  const n = Number(process.env.VOIP_AUDIO_STREAM_INTERVAL_MS || process.env.AUDIO_STREAM_INTERVAL_MS)
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_AUDIO_STREAM_INTERVAL_MS
+}
+
+const dtmfPlaybackMs = (digitCount) => {
+  if (!digitCount || digitCount <= 0) return 0
+  return digitCount * DTMF_TONE_MS + Math.max(0, digitCount - 1) * DTMF_PAUSE_MS
+}
+
+/** Wait before turn-audio slice so DTMF PCM is flushed through audioStream (250 ms default). */
+const dtmfTurnAudioWaitMs = (digitCount) => {
+  const playbackMs = dtmfPlaybackMs(digitCount)
+  const streamMs = audioStreamIntervalMs()
+  return Math.max(digitCount * DTMF_MS_PER_DIGIT, playbackMs + streamMs + 50)
+}
+
 const Capabilities = {
   VOIP_STT_URL_STREAM: 'VOIP_STT_URL_STREAM',
   VOIP_STT_PARAMS_STREAM: 'VOIP_STT_PARAMS_STREAM',
   VOIP_STT_METHOD_STREAM: 'VOIP_STT_METHOD_STREAM',
   VOIP_STT_BODY_STREAM: 'VOIP_STT_BODY_STREAM',
   VOIP_STT_BODY: 'VOIP_STT_BODY',
+  VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS: 'VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS',
   VOIP_STT_HEADERS: 'VOIP_STT_HEADERS',
   VOIP_STT_TIMEOUT: 'VOIP_STT_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
@@ -107,6 +134,7 @@ const Defaults = {
   VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false,
   VOIP_STT_CONFIDENCE_THRESHOLD: 0.5,
+  VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS: 500,
   VOIP_USE_GLOBAL_VOIP_WORKER: false,
   VOIP_SIP_PROTOCOL: 'TCP',
   VOIP_USER_INPUT_PREFER_VOICE: true,
@@ -114,6 +142,36 @@ const Defaults = {
   VOIP_TURN_AUDIO_ENABLE: true,
   VOIP_TURN_AUDIO_PADDING_MS: 150,
   VOIP_TURN_AUDIO_OFFSET_MS: 0
+}
+
+// Inject the Azure end-of-speech segmentation timeout into the STT body. botium-speech-processing
+// applies azure.config.properties via SpeechConfig.setProperty(), so this controls how long Azure
+// waits after the last word before emitting final=true. Only applied for the Azure engine, never
+// overrides a value already present in the profile config, and clones so the capability object stays
+// untouched. Set the capability to 0/empty to disable injection.
+const injectAzureSegmentationTimeout = (body, sttParams, timeoutMs) => {
+  const ms = Number(timeoutMs)
+  if (!_.isFinite(ms) || ms <= 0) return body
+  const isAzure = (sttParams && sttParams.stt === 'azure') ||
+    (body && typeof body === 'object' && body.azure) ||
+    (typeof body === 'string' && body.indexOf('azure') !== -1)
+  if (!isAzure) return body
+
+  let next
+  if (body == null) {
+    next = {}
+  } else if (typeof body === 'string') {
+    try { next = JSON.parse(body) } catch (err) { return body }
+  } else {
+    next = _.cloneDeep(body)
+  }
+  if (!_.isObject(next.azure)) next.azure = {}
+  if (!_.isObject(next.azure.config)) next.azure.config = {}
+  if (!_.isObject(next.azure.config.properties)) next.azure.config.properties = {}
+  if (next.azure.config.properties.Speech_SegmentationSilenceTimeoutMs == null) {
+    next.azure.config.properties.Speech_SegmentationSilenceTimeoutMs = String(Math.round(ms))
+  }
+  return next
 }
 
 const TTS_HTTP_AGENT = new http.Agent({ keepAlive: true })
@@ -136,6 +194,8 @@ class BotiumConnectorVoip {
     // For debugging latency between incoming STT (bot says) and outgoing audio (sendAudio)
     this._lastBotSaysQueuedAt = null
     this._lastBotSaysText = null
+    this._replyTrace = null
+    this._activeUserSaysVoipAgent = null
     this._speculativeTurnToken = 0
   }
 
@@ -187,6 +247,8 @@ class BotiumConnectorVoip {
     this.convoStep = null
     this._lastBotSaysQueuedAt = null
     this._lastBotSaysText = null
+    this._replyTrace = null
+    this._activeUserSaysVoipAgent = null
     this.audioStream = { format: null, pcmParts: [], totalBytes: 0, complete: false }
     this._turnAudioCounter = 0
     this._lastBotTurnStartSec = null
@@ -198,6 +260,7 @@ class BotiumConnectorVoip {
       const queuedAt = Date.now()
       this._lastBotSaysQueuedAt = queuedAt
       this._lastBotSaysText = botMsg && botMsg.messageText ? String(botMsg.messageText) : null
+      this._captureBotQueuedForReplyTrace(queuedAt)
       // Stamp the wall-clock instant at which the connector released the bot
       // utterance to botium-core's queue. Paired with `_receivedAtMs` (last
       // STT final frame) this gives the true "join silence" the connector
@@ -205,8 +268,12 @@ class BotiumConnectorVoip {
       // message up with WaitBotSays().
       if (botMsg && botMsg.sourceData) {
         const head = Array.isArray(botMsg.sourceData) ? botMsg.sourceData[0] : botMsg.sourceData
-        if (head && typeof head === 'object' && !('flushedAtMs' in head)) {
-          head.flushedAtMs = queuedAt
+        if (head && typeof head === 'object') {
+          if (!('flushedAtMs' in head)) head.flushedAtMs = queuedAt
+          if (this._replyTrace) {
+            if (_.isFinite(this._replyTrace.psstFireDelayMs)) head.psstFireDelayMs = this._replyTrace.psstFireDelayMs
+            if (_.isFinite(this._replyTrace.psstScheduledMs)) head.psstScheduledMs = this._replyTrace.psstScheduledMs
+          }
         }
       }
       // A turn = bot speaks first, then me responds.
@@ -249,6 +316,10 @@ class BotiumConnectorVoip {
         botMsg.sourceData[0].silenceDuration = _.isFinite(firstStart) ? firstStart : null
         botMsg.sourceData[0].voiceDuration = (_.isFinite(firstStart) && _.isFinite(lastEnd)) ? (lastEnd - firstStart) : null
       }
+      const lastSpeechEnd = _.get(botMsgs, `[${botMsgs.length - 1}].sourceData.data.speechEndSec`, null)
+      if (_.isFinite(lastSpeechEnd) && botMsg.sourceData[0] && botMsg.sourceData[0].data) {
+        botMsg.sourceData[0].data.speechEndSec = lastSpeechEnd
+      }
       return botMsg
     }
 
@@ -284,6 +355,7 @@ class BotiumConnectorVoip {
       }
       const bufferedAtArm = this.botMsgs.length
       const armedAt = Date.now()
+      this._markReplyTrace({ psstTimerArmedAtMs: armedAt, psstScheduledMs: joinTimeoutMs || 0 })
       _info('psst_timer_armed', {
         sessionId: this.sessionId,
         joinTimeoutMs: joinTimeoutMs || 0,
@@ -307,6 +379,7 @@ class BotiumConnectorVoip {
       }
       this.silenceTimeout = setTimeout(() => {
         const fireDelay = Date.now() - armedAt
+        this._markReplyTrace({ psstTimerFiredAtMs: Date.now(), psstFireDelayMs: fireDelay })
         if (this.botMsgs.length > 0) {
           _info('psst_timer_fired', {
             sessionId: this.sessionId,
@@ -593,7 +666,11 @@ class BotiumConnectorVoip {
           STT_CONFIG: {
             stt_url: sttUrl,
             stt_params: this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
-            stt_body: this.caps[Capabilities.VOIP_STT_BODY_STREAM] || null
+            stt_body: injectAzureSegmentationTimeout(
+              this.caps[Capabilities.VOIP_STT_BODY_STREAM] || null,
+              this.caps[Capabilities.VOIP_STT_PARAMS_STREAM],
+              this.caps[Capabilities.VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS]
+            )
           },
           TTS_CONFIG: {
             tts_url: this.caps[Capabilities.VOIP_TTS_URL],
@@ -859,6 +936,7 @@ class BotiumConnectorVoip {
                 const buf = Buffer.from(parsedData.chunk, 'base64')
                 this.audioStream.pcmParts.push(buf)
                 this.audioStream.totalBytes += buf.length
+                this._maybeDetectAgentAudibleOnRecording(this._activeUserSaysVoipAgent)
               } catch (e) {
                 debug(`${this.sessionId} - audioStreamChunk decode error: ${e && e.message}`)
               }
@@ -890,6 +968,35 @@ class BotiumConnectorVoip {
             // dropped when Stop() clears the PSST silence timer on teardown.
             flushPendingBotMsgs('fullRecordEnd')
             this.end = true
+          }
+
+          if (parsedData && parsedData.type === 'agentPlaybackStarted') {
+            const playbackData = parsedData.data || {}
+            const playedSec = playbackData.playedRecordingStartSec
+            const active = this._activeUserSaysVoipAgent
+            if (active && _.isFinite(playedSec)) {
+              active.playedRecordingStartSec = playedSec
+              active.playbackAtMs = playbackData.playbackAtMs
+              if (_.isFinite(playbackData.requestedDurationMs)) {
+                active.playbackRequestedDurationMs = playbackData.requestedDurationMs
+              }
+              if (_.isFinite(playbackData.digitCount)) {
+                active.digitCount = playbackData.digitCount
+              }
+              this._markReplyTrace({
+                playedRecordingStartSec: playedSec,
+                playbackAtMs: playbackData.playbackAtMs
+              })
+              const heardSec = playbackData.wireKind === 'dtmf'
+                ? playedSec
+                : this._applyAgentHeardRecordingStartSec(active)
+              if (_.isFinite(heardSec)) {
+                if (playbackData.wireKind === 'dtmf') {
+                  active.heardRecordingStartSec = heardSec
+                }
+                debug(`${this.sessionId} - agent audible on recording at ${heardSec}s (played=${playedSec}s)`)
+              }
+            }
           }
 
           if (parsedData && parsedData.type === 'silence') {
@@ -1021,8 +1128,13 @@ class BotiumConnectorVoip {
               messageLength: msgLen,
               confidence: this._getConfidenceScore(parsedData),
               threshold: confidenceThreshold,
-              accepted: successfulConfidenceScore
+              accepted: successfulConfidenceScore,
+              segmentEndSec: _.isFinite(_.get(parsedData, 'data.end')) ? parsedData.data.end : null,
+              speechEndSec: _.isFinite(_.get(parsedData, 'data.speechEndSec')) ? parsedData.data.speechEndSec : null
             })
+            if (successfulConfidenceScore) {
+              this._captureSttFinalForReplyTrace(parsedData, msgPreview)
+            }
             // ORIGINAL: always emit final message immediately (ignore JOIN hooks/rules).
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
               let botMsg = { messageText: normalizedMsgText }
@@ -1131,6 +1243,7 @@ class BotiumConnectorVoip {
       messageLength: hasText && msg.messageText ? msg.messageText.length : undefined,
       mediaSize: hasVoiceMedia && msg.media[0] && Buffer.isBuffer(msg.media[0].buffer) ? msg.media[0].buffer.length : undefined
     })
+    this._captureUserSaysStart(msgPreview)
     // Avoid logging large buffers/base64 (can break job logs and overwhelm stdout)
     try {
       const safeLog = {
@@ -1166,12 +1279,7 @@ class BotiumConnectorVoip {
           // the coach can place the agent turn on the recording timeline.
           // `requestedDurationMs` is the best estimate of on-wire playback
           // length (DTMF tones × digits, TTS synth output, parsed media duration).
-          const recordingSecNow = () => {
-            const fmt = this.audioStream && this.audioStream.format
-            const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
-            if (!bytesPerSec || !this.audioStream || !(this.audioStream.totalBytes > 0)) return null
-            return this.audioStream.totalBytes / bytesPerSec
-          }
+          const recordingSecNow = () => this._recordingSecNow()
           const stampAgentWire = (wireKind, requestedDurationMs, extras = {}) => {
             const wireRecordingStartSec = recordingSecNow()
             msg.voipAgent = {
@@ -1182,9 +1290,16 @@ class BotiumConnectorVoip {
               ...(wireRecordingStartSec != null ? { wireRecordingStartSec } : {}),
               ...extras
             }
+            this._activeUserSaysVoipAgent = msg.voipAgent
+            this._captureAgentWire(msg.voipAgent, inputType)
+          }
+          const sendAgentWire = (request) => {
+            this._sendUserSaysWs(request)
+            this._markReplyTrace({ sendAudioAtMs: Date.now() })
+            this._logReplyTrace('wire_sent')
           }
           // Twilio default: 100 ms tone + 100 ms gap per digit. Drives agent-bar width only.
-          const DTMF_MS_PER_DIGIT = 200
+          const DTMF_AGENT_BAR_MS_PER_DIGIT = DTMF_MS_PER_DIGIT
 
           if (msg && msg.buttons && msg.buttons.length > 0) {
             const digits = sanitizeDtmfDigits(msg.buttons[0].payload)
@@ -1198,11 +1313,10 @@ class BotiumConnectorVoip {
               digits,
               sessionId: this.sessionId
             })
-            stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
-            this._sendUserSaysWs(request)
-            // Wait for the DTMF tones to be played/recorded before slicing the
-            // turn audio, so the tones are included in the per-turn segment.
-            duration = (digits.length * DTMF_MS_PER_DIGIT) / 1000
+            stampAgentWire('dtmf', digits.length * DTMF_AGENT_BAR_MS_PER_DIGIT, { digitCount: digits.length, dtmfDigits: digits })
+            sendAgentWire(request)
+            // Wait for DTMF playback plus at least one audioStream flush before slicing turn audio.
+            duration = dtmfTurnAudioWaitMs(digits.length) / 1000
           } else if (msg && msg.messageText) {
           // Check for DTMF tag in messageText: <DTMF>1234</DTMF>
             const dtmfMatch = msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
@@ -1223,11 +1337,10 @@ class BotiumConnectorVoip {
                 digits,
                 sessionId: this.sessionId
               })
-              stampAgentWire('dtmf', digits.length * DTMF_MS_PER_DIGIT, { digitCount: digits.length })
-              this._sendUserSaysWs(request)
-              // Wait for the DTMF tones to be played/recorded before slicing the
-              // turn audio, so the tones are included in the per-turn segment.
-              duration = (digits.length * DTMF_MS_PER_DIGIT) / 1000
+              stampAgentWire('dtmf', digits.length * DTMF_AGENT_BAR_MS_PER_DIGIT, { digitCount: digits.length, dtmfDigits: digits })
+              sendAgentWire(request)
+              // Wait for DTMF playback plus at least one audioStream flush before slicing turn audio.
+              duration = dtmfTurnAudioWaitMs(digits.length) / 1000
             } else if (!skipTtsForMixedInput) {
               if (!this.axiosTtsParams) {
                 if (!(msg.media && msg.media.length > 0 && msg.media[0].buffer)) {
@@ -1241,10 +1354,12 @@ class BotiumConnectorVoip {
 
                 let ttsResult = null
                 const ttsStartedAt = Date.now()
+                this._markReplyTrace({ ttsStartAtMs: ttsStartedAt })
                 let ttsSynthMs = 0
                 try {
                   ttsResult = await this._getTtsAudio(ttsRequest, msg.messageText)
                   ttsSynthMs = Date.now() - ttsStartedAt
+                  this._markReplyTrace({ ttsEndAtMs: Date.now(), ttsSynthMs })
                 } catch (err) {
                   return reject(new Error(`TTS "${msg.messageText}" failed - ${this._getAxiosErrOutput(err)}`))
                 }
@@ -1280,7 +1395,7 @@ class BotiumConnectorVoip {
                     ttsSynthMs,
                     textLength: msg.messageText ? msg.messageText.length : 0
                   })
-                  this._sendUserSaysWs(request)
+                  sendAgentWire(request)
                 } else {
                   return reject(new Error('TTS failed, response is empty'))
                 }
@@ -1303,7 +1418,7 @@ class BotiumConnectorVoip {
             }
             // Stamp now; `requestedDurationMs` is backfilled once media metadata is parsed.
             stampAgentWire('media', 0, { mediaUri: msg.media[0].mediaUri || null })
-            this._sendUserSaysWs(request)
+            sendAgentWire(request)
             msg.attachments.push({
               name: msg.media[0].mediaUri,
               mimeType: msg.media[0].mimeType,
@@ -1326,25 +1441,44 @@ class BotiumConnectorVoip {
             }
           }
           const requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
+          const isDtmfTurn = msg.voipAgent && msg.voipAgent.wireKind === 'dtmf'
 
           // After the TTS/media finishes playing, slice the full turn audio
           // (bot spoke first + me just finished) and attach it to this me-step.
-          const attachTurnAudioAndResolve = () => {
+          const attachTurnAudioAndResolve = (endSecOverride) => {
             try {
               const fmt = this.audioStream && this.audioStream.format
               const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
-              const endSec = (bytesPerSec && this.audioStream && this.audioStream.totalBytes > 0)
-                ? this.audioStream.totalBytes / bytesPerSec
-                : null
-              if (msg.voipAgent && _.isFinite(endSec) && requestedDurationMs > 0) {
-                const requestedSec = requestedDurationMs / 1000
-                const fromEnd = Math.max(0, endSec - requestedSec)
-                const wireSec = msg.voipAgent.wireRecordingStartSec
-                msg.voipAgent.heardRecordingStartSec = _.isFinite(wireSec)
-                  ? Math.max(wireSec, fromEnd)
-                  : fromEnd
+              const endSec = _.isFinite(endSecOverride)
+                ? endSecOverride
+                : ((bytesPerSec && this.audioStream && this.audioStream.totalBytes > 0)
+                  ? this.audioStream.totalBytes / bytesPerSec
+                  : null)
+              if (msg.voipAgent) {
+                const heardSec = msg.voipAgent.wireKind === 'dtmf' && _.isFinite(msg.voipAgent.playedRecordingStartSec)
+                  ? msg.voipAgent.playedRecordingStartSec
+                  : this._applyAgentHeardRecordingStartSec(msg.voipAgent, msg.attachments)
+                if (!_.isFinite(heardSec) && _.isFinite(endSec) && requestedDurationMs > 0) {
+                  const requestedSec = msg.voipAgent.wireKind === 'dtmf'
+                    ? this._dtmfPlaybackSec(msg.voipAgent, msg.voipAgent.digitCount || 1)
+                    : (requestedDurationMs / 1000)
+                  const fromEnd = Math.max(0, endSec - requestedSec)
+                  const wireSec = msg.voipAgent.wireRecordingStartSec
+                  msg.voipAgent.heardRecordingStartSec = _.isFinite(wireSec)
+                    ? Math.max(wireSec, fromEnd)
+                    : fromEnd
+                } else if (_.isFinite(heardSec) && !_.isFinite(msg.voipAgent.heardRecordingStartSec)) {
+                  msg.voipAgent.heardRecordingStartSec = heardSec
+                }
               }
+              if (msg.voipAgent && _.isFinite(msg.voipAgent.heardRecordingStartSec)) {
+                this._markReplyTrace({ heardRecordingStartSec: msg.voipAgent.heardRecordingStartSec })
+              }
+              this._logReplyTraceHeard(endSec)
               if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && _.isFinite(this._lastBotTurnStartSec) && _.isFinite(endSec) && endSec > this._lastBotTurnStartSec) {
+                // The real DTMF tone is mixed into full_record by the worker and arrives via the
+                // audioStream tail, so the per-turn slice already contains it (the slice end waits for
+                // the DTMF tail via _waitForDtmfTurnEndSec). No synthesized tone is injected.
                 const audioBase64 = this._sliceTurnAudio(this._lastBotTurnStartSec, endSec)
                 if (audioBase64) {
                   this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
@@ -1359,18 +1493,421 @@ class BotiumConnectorVoip {
             } catch (err) {
               debug(`UserSays: turn audio slice error: ${err && err.message}`)
             }
+            this._activeUserSaysVoipAgent = null
+            this._finalizeWallPipeline(msg.voipAgent)
             resolve()
           }
 
-          if (requestedDurationMs <= 0) {
-            return attachTurnAudioAndResolve()
+          const finalizeUserSays = async () => {
+            let endSecOverride = null
+            if (isDtmfTurn) {
+              const digitCount = msg.voipAgent.digitCount || 1
+              const paddingSec = (this.caps[Capabilities.VOIP_TURN_AUDIO_PADDING_MS] || 0) / 1000
+              const timeoutMs = dtmfTurnAudioWaitMs(digitCount) + 1500
+              endSecOverride = await this._waitForDtmfTurnEndSec(msg.voipAgent, digitCount, paddingSec, timeoutMs)
+            }
+            attachTurnAudioAndResolve(endSecOverride)
           }
-          setTimeout(attachTurnAudioAndResolve, requestedDurationMs)
+
+          if (isDtmfTurn) {
+            finalizeUserSays()
+          } else if (requestedDurationMs <= 0) {
+            attachTurnAudioAndResolve()
+          } else {
+            setTimeout(() => attachTurnAudioAndResolve(), requestedDurationMs)
+          }
         } catch (err) {
           reject(err)
         }
       }, 0)
     })
+  }
+
+  _recordingSecNow () {
+    const fmt = this.audioStream && this.audioStream.format
+    const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
+    if (!bytesPerSec || !this.audioStream || !(this.audioStream.totalBytes > 0)) return null
+    return this.audioStream.totalBytes / bytesPerSec
+  }
+
+  /**
+   * Poll audioStream until DTMF PCM has been flushed through audioStream.
+   * Slice end must be derived from playedRecordingStartSec (worker timeline),
+   * not wireRecordingStartSec — the WS send can be hundreds of ms before DTMF
+   * is injected into full_recorder, and silence after bot can satisfy an early
+   * wire-based threshold for single-digit DTMF.
+   */
+  _dtmfPlaybackSec (voipAgent, digitCount) {
+    const playbackMs = voipAgent && voipAgent.playbackRequestedDurationMs
+    if (_.isFinite(playbackMs) && playbackMs > 0) return playbackMs / 1000
+    return dtmfPlaybackMs(digitCount) / 1000
+  }
+
+  _waitForDtmfTurnEndSec (voipAgent, digitCount, paddingSec, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    return new Promise((resolve) => {
+      const tick = () => {
+        const streamEndSec = this._recordingSecNow()
+        const playedSec = voipAgent && voipAgent.playedRecordingStartSec
+        const streamSlackSec = (audioStreamIntervalMs() + 50) / 1000
+
+        if (!_.isFinite(playedSec)) {
+          if (Date.now() >= deadline) {
+            debug(`${this.sessionId} - DTMF turn audio wait timeout without playedRecordingStartSec (digits=${digitCount})`)
+            return resolve(streamEndSec)
+          }
+          return setTimeout(tick, 50)
+        }
+
+        const dtmfSec = this._dtmfPlaybackSec(voipAgent, digitCount)
+        const minEndSec = playedSec + dtmfSec + paddingSec + streamSlackSec
+
+        if (_.isFinite(streamEndSec) && streamEndSec >= minEndSec) {
+          debug(`${this.sessionId} - DTMF turn audio ready at ${streamEndSec.toFixed(3)}s (played=${playedSec.toFixed(3)}s need=${minEndSec.toFixed(3)}s digits=${digitCount} dtmfSec=${dtmfSec.toFixed(3)})`)
+          return resolve(streamEndSec)
+        }
+        if (Date.now() >= deadline) {
+          debug(`${this.sessionId} - DTMF turn audio wait timeout at ${streamEndSec != null ? streamEndSec.toFixed(3) : 'null'}s (played=${playedSec.toFixed(3)}s need=${minEndSec.toFixed(3)}s digits=${digitCount})`)
+          return resolve(streamEndSec)
+        }
+        setTimeout(tick, 50)
+      }
+      tick()
+    })
+  }
+
+  _agentSpeechRmsThreshold () {
+    const raw = process.env.VOIP_AGENT_SPEECH_RMS_THRESHOLD
+    const n = raw != null ? Number(raw) : DEFAULT_AGENT_SPEECH_RMS_THRESHOLD
+    return Number.isFinite(n) && n > 0 ? n : DEFAULT_AGENT_SPEECH_RMS_THRESHOLD
+  }
+
+  _agentSpeechSustainedWindows () {
+    const raw = process.env.VOIP_AGENT_SPEECH_SUSTAINED_WINDOWS
+    const n = raw != null ? parseInt(raw, 10) : DEFAULT_AGENT_SPEECH_SUSTAINED_WINDOWS
+    return Number.isFinite(n) && n > 0 ? n : DEFAULT_AGENT_SPEECH_SUSTAINED_WINDOWS
+  }
+
+  _audioStreamBytesPerSec () {
+    const fmt = this.audioStream && this.audioStream.format
+    if (!fmt) return null
+    return fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8)
+  }
+
+  _pcmBufferRms (pcm, bitsPerSample) {
+    if (!pcm || pcm.length < 2 || bitsPerSample !== 16) return 0
+    let sum = 0
+    let count = 0
+    for (let i = 0; i + 1 < pcm.length; i += 2) {
+      const sample = pcm.readInt16LE(i)
+      sum += sample * sample
+      count += 1
+    }
+    return count > 0 ? Math.sqrt(sum / count) : 0
+  }
+
+  _readWavPcmInfo (wavBuffer) {
+    if (!wavBuffer || wavBuffer.length < 44) return null
+    if (wavBuffer.toString('ascii', 0, 4) !== 'RIFF' || wavBuffer.toString('ascii', 8, 12) !== 'WAVE') {
+      return null
+    }
+    let offset = 12
+    let sampleRate = null
+    let channels = null
+    let bitsPerSample = null
+    let dataOffset = null
+    let dataLength = null
+    while (offset + 8 <= wavBuffer.length) {
+      const chunkId = wavBuffer.toString('ascii', offset, offset + 4)
+      const chunkSize = wavBuffer.readUInt32LE(offset + 4)
+      const chunkStart = offset + 8
+      if (chunkId === 'fmt ' && chunkSize >= 16) {
+        channels = wavBuffer.readUInt16LE(chunkStart + 2)
+        sampleRate = wavBuffer.readUInt32LE(chunkStart + 4)
+        bitsPerSample = wavBuffer.readUInt16LE(chunkStart + 14)
+      } else if (chunkId === 'data') {
+        dataOffset = chunkStart
+        dataLength = chunkSize
+        break
+      }
+      offset = chunkStart + chunkSize + (chunkSize % 2)
+    }
+    if (!sampleRate || !channels || !bitsPerSample || dataOffset == null) return null
+    const bytesPerSec = sampleRate * channels * (bitsPerSample / 8)
+    if (!bytesPerSec) return null
+    const pcmLength = dataLength != null
+      ? Math.min(dataLength, wavBuffer.length - dataOffset)
+      : (wavBuffer.length - dataOffset)
+    return { pcmOffset: dataOffset, pcmLength, bytesPerSec, bitsPerSample, sampleRate, channels }
+  }
+
+  _findAudibleLeadInSecFromPcm (pcm, bytesPerSec, bitsPerSample) {
+    if (!pcm || !bytesPerSec) return null
+    const threshold = this._agentSpeechRmsThreshold()
+    const sustainedWindows = this._agentSpeechSustainedWindows()
+    const windowBytes = Math.max(2, Math.floor(bytesPerSec * (AGENT_SPEECH_RMS_WINDOW_MS / 1000)))
+    const hopBytes = Math.max(2, Math.floor(windowBytes / 2))
+    let streak = 0
+    let onsetPos = null
+    for (let pos = 0; pos + windowBytes <= pcm.length; pos += hopBytes) {
+      const rms = this._pcmBufferRms(pcm.subarray(pos, pos + windowBytes), bitsPerSample)
+      if (rms >= threshold) {
+        if (streak === 0) onsetPos = pos
+        streak += 1
+        if (streak >= sustainedWindows) {
+          return onsetPos / bytesPerSec
+        }
+      } else {
+        streak = 0
+        onsetPos = null
+      }
+    }
+    return null
+  }
+
+  _findAudibleLeadInSecFromWavBuffer (wavBuffer) {
+    const info = this._readWavPcmInfo(wavBuffer)
+    if (!info) return null
+    const pcm = wavBuffer.subarray(info.pcmOffset, info.pcmOffset + info.pcmLength)
+    return this._findAudibleLeadInSecFromPcm(pcm, info.bytesPerSec, info.bitsPerSample)
+  }
+
+  _findAudibleRecordingStartSecOnStream (playedSec, wireSec) {
+    if (!_.isFinite(playedSec)) return null
+    const bytesPerSec = this._audioStreamBytesPerSec()
+    const stream = this.audioStream
+    if (!bytesPerSec || !stream || !stream.pcmParts.length) return null
+    const startByte = Math.max(0, Math.floor(playedSec * bytesPerSec))
+    const pcm = Buffer.concat(stream.pcmParts)
+    if (startByte >= pcm.length) return null
+    const bitsPerSample = stream.format.bitsPerSample
+    const leadInSec = this._findAudibleLeadInSecFromPcm(
+      pcm.subarray(startByte),
+      bytesPerSec,
+      bitsPerSample
+    )
+    if (!_.isFinite(leadInSec)) return null
+    let heardSec = playedSec + leadInSec
+    if (_.isFinite(wireSec)) heardSec = Math.max(wireSec, heardSec)
+    return heardSec
+  }
+
+  _findAudibleRecordingStartSecFromAttachments (playedSec, wireSec, attachments) {
+    if (!_.isFinite(playedSec) || !_.isArray(attachments)) return null
+    const tts = attachments.find((a) => a && a.name === 'tts.wav' && a.base64)
+    if (!tts) return null
+    try {
+      const wavBuffer = Buffer.from(tts.base64, 'base64')
+      const leadInSec = this._findAudibleLeadInSecFromWavBuffer(wavBuffer)
+      if (!_.isFinite(leadInSec)) return null
+      let heardSec = playedSec + leadInSec
+      if (_.isFinite(wireSec)) heardSec = Math.max(wireSec, heardSec)
+      return heardSec
+    } catch (err) {
+      debug(`${this.sessionId} - TTS lead-in scan failed: ${err && err.message}`)
+      return null
+    }
+  }
+
+  _resolveAgentHeardRecordingStartSec (voipAgent, attachments) {
+    if (!voipAgent || !_.isFinite(voipAgent.playedRecordingStartSec)) return null
+    const playedSec = voipAgent.playedRecordingStartSec
+    const wireSec = voipAgent.wireRecordingStartSec
+    const fromTts = this._findAudibleRecordingStartSecFromAttachments(playedSec, wireSec, attachments)
+    const fromStream = this._findAudibleRecordingStartSecOnStream(playedSec, wireSec)
+    const candidates = [fromTts, fromStream].filter((s) => _.isFinite(s))
+    if (!candidates.length) return null
+    // Prefer the later onset — mixed recording can spike before clear TTS speech.
+    return Math.max(...candidates)
+  }
+
+  _applyAgentHeardRecordingStartSec (voipAgent, attachments) {
+    if (!voipAgent || !_.isFinite(voipAgent.playedRecordingStartSec)) return null
+    const heardSec = this._resolveAgentHeardRecordingStartSec(voipAgent, attachments)
+    if (!_.isFinite(heardSec) || heardSec <= voipAgent.playedRecordingStartSec) {
+      return _.isFinite(voipAgent.heardRecordingStartSec) ? voipAgent.heardRecordingStartSec : null
+    }
+    const prev = voipAgent.heardRecordingStartSec
+    if (_.isFinite(prev) && prev >= heardSec) return prev
+    voipAgent.heardRecordingStartSec = heardSec
+    this._markReplyTrace({ heardRecordingStartSec: heardSec })
+    return heardSec
+  }
+
+  _maybeDetectAgentAudibleOnRecording (voipAgent) {
+    if (!voipAgent || !_.isFinite(voipAgent.playedRecordingStartSec)) return
+    this._applyAgentHeardRecordingStartSec(voipAgent)
+  }
+
+  _markReplyTrace (patch) {
+    if (!this._replyTrace || !patch) return
+    Object.assign(this._replyTrace, patch)
+  }
+
+  _captureSttFinalForReplyTrace (parsedData, msgPreview) {
+    const data = parsedData && parsedData.data
+    const atMs = parsedData._receivedAtMs || Date.now()
+    const recordingAtSttFinalSec = this._recordingSecNow()
+    if (parsedData && _.isFinite(recordingAtSttFinalSec)) {
+      parsedData.recordingAtSttFinalSec = recordingAtSttFinalSec
+    }
+    // Dedicated, self-documenting anchor for the downstream "STT transport" sub-phase
+    // (receivedAtMs - finalEmittedWallMs). Unlike the generic _receivedAtMs (stamped on
+    // every WS frame), this is set only on the accepted STT-final.
+    if (parsedData && _.isFinite(atMs)) {
+      parsedData.sttFinalReceivedAtMs = atMs
+    }
+    this._replyTrace = {
+      sessionId: this.sessionId,
+      botMessagePreview: msgPreview || undefined,
+      sttFinalAtMs: atMs,
+      sttRecordingStartSec: _.isFinite(_.get(data, 'start')) ? data.start : null,
+      sttRecordingEndSec: _.isFinite(_.get(data, 'end')) ? data.end : null,
+      sttSpeechEndSec: _.isFinite(_.get(data, 'speechEndSec')) ? data.speechEndSec : null,
+      recordingAtSttFinalSec: _.isFinite(recordingAtSttFinalSec) ? recordingAtSttFinalSec : null,
+      queueAtMs: null,
+      recordingAtQueueSec: null,
+      psstTimerArmedAtMs: null,
+      psstScheduledMs: null,
+      psstTimerFiredAtMs: null,
+      psstFireDelayMs: null,
+      userSaysAtMs: null,
+      coachWaitMs: null,
+      ttsStartAtMs: null,
+      ttsEndAtMs: null,
+      ttsSynthMs: null,
+      wireAtMs: null,
+      wireRecordingStartSec: null,
+      sendAudioAtMs: null,
+      playedRecordingStartSec: null,
+      playbackAtMs: null,
+      heardRecordingStartSec: null,
+      agentEndRecordingSec: null,
+      wireKind: null,
+      inputType: null,
+      requestedDurationMs: null,
+      meMessagePreview: null
+    }
+  }
+
+  _captureBotQueuedForReplyTrace (queuedAt) {
+    if (!this._replyTrace) return
+    this._replyTrace.queueAtMs = queuedAt
+    this._replyTrace.recordingAtQueueSec = this._recordingSecNow()
+  }
+
+  _captureUserSaysStart (msgPreview) {
+    if (!this._replyTrace) return
+    const now = Date.now()
+    this._replyTrace.userSaysAtMs = now
+    this._replyTrace.meMessagePreview = msgPreview || undefined
+    const queueAt = this._replyTrace.queueAtMs || this._lastBotSaysQueuedAt
+    if (_.isFinite(queueAt)) {
+      if (!this._replyTrace.queueAtMs) this._replyTrace.queueAtMs = queueAt
+      this._replyTrace.coachWaitMs = now - queueAt
+    }
+  }
+
+  _captureAgentWire (voipAgent, inputType) {
+    if (!this._replyTrace || !voipAgent) return
+    this._replyTrace.wireAtMs = voipAgent.wireSentAtMs
+    this._replyTrace.wireRecordingStartSec = voipAgent.wireRecordingStartSec
+    this._replyTrace.wireKind = voipAgent.wireKind
+    this._replyTrace.inputType = inputType
+    this._replyTrace.requestedDurationMs = voipAgent.requestedDurationMs
+    if (_.isFinite(voipAgent.ttsSynthMs)) this._replyTrace.ttsSynthMs = voipAgent.ttsSynthMs
+  }
+
+  _finalizeWallPipeline (voipAgent) {
+    const t = this._replyTrace
+    if (!voipAgent || !t) return
+    voipAgent.wallPipeline = {
+      psstScheduledMs: _.isFinite(t.psstScheduledMs) ? t.psstScheduledMs : null,
+      psstFireDelayMs: _.isFinite(t.psstFireDelayMs) ? t.psstFireDelayMs : null,
+      coachWaitMs: _.isFinite(t.coachWaitMs) ? t.coachWaitMs : null,
+      userSaysAtMs: _.isFinite(t.userSaysAtMs) ? t.userSaysAtMs : null,
+      ttsStartAtMs: _.isFinite(t.ttsStartAtMs) ? t.ttsStartAtMs : null,
+      ttsEndAtMs: _.isFinite(t.ttsEndAtMs) ? t.ttsEndAtMs : null,
+      ttsSynthMs: _.isFinite(t.ttsSynthMs) ? t.ttsSynthMs : null,
+      wireAtMs: _.isFinite(t.wireAtMs) ? t.wireAtMs : null,
+      sendAudioAtMs: _.isFinite(t.sendAudioAtMs) ? t.sendAudioAtMs : null
+    }
+  }
+
+  _replyTraceMsFromSttFinal (atMs) {
+    const anchor = this._replyTrace && this._replyTrace.sttFinalAtMs
+    if (!_.isFinite(anchor) || !_.isFinite(atMs)) return null
+    return Math.round(atMs - anchor)
+  }
+
+  _replyTraceRecMs (fromSec, toSec) {
+    if (!_.isFinite(fromSec) || !_.isFinite(toSec)) return null
+    return Math.round((toSec - fromSec) * 1000)
+  }
+
+  _logReplyTrace (trigger) {
+    const t = this._replyTrace
+    if (!t || !_.isFinite(t.sttFinalAtMs)) return
+    _info('voip_reply_trace', {
+      sessionId: t.sessionId,
+      trigger,
+      botPreview: t.botMessagePreview,
+      mePreview: t.meMessagePreview,
+      sttRecordingStartSec: t.sttRecordingStartSec,
+      sttRecordingEndSec: t.sttRecordingEndSec,
+      sttSpeechEndSec: t.sttSpeechEndSec,
+      recordingAtSttFinalSec: t.recordingAtSttFinalSec,
+      recordingAtQueueSec: t.recordingAtQueueSec,
+      wireRecordingStartSec: t.wireRecordingStartSec,
+      wireKind: t.wireKind,
+      inputType: t.inputType,
+      requestedDurationMs: t.requestedDurationMs,
+      ttsSynthMs: t.ttsSynthMs,
+      coachWaitMs: t.coachWaitMs,
+      psstScheduledMs: t.psstScheduledMs,
+      psstFireDelayMs: t.psstFireDelayMs,
+      ms_sttFinal_to_queue: this._replyTraceMsFromSttFinal(t.queueAtMs),
+      ms_sttFinal_to_psstFire: this._replyTraceMsFromSttFinal(t.psstTimerFiredAtMs),
+      ms_sttFinal_to_userSays: this._replyTraceMsFromSttFinal(t.userSaysAtMs),
+      ms_sttFinal_to_ttsStart: this._replyTraceMsFromSttFinal(t.ttsStartAtMs),
+      ms_sttFinal_to_ttsEnd: this._replyTraceMsFromSttFinal(t.ttsEndAtMs),
+      ms_sttFinal_to_wire: this._replyTraceMsFromSttFinal(t.wireAtMs),
+      ms_sttFinal_to_sendAudio: this._replyTraceMsFromSttFinal(t.sendAudioAtMs),
+      ms_userSays_to_ttsStart: (_.isFinite(t.userSaysAtMs) && _.isFinite(t.ttsStartAtMs))
+        ? Math.round(t.ttsStartAtMs - t.userSaysAtMs) : null,
+      ms_userSays_to_wire: (_.isFinite(t.userSaysAtMs) && _.isFinite(t.wireAtMs))
+        ? Math.round(t.wireAtMs - t.userSaysAtMs) : null,
+      ms_queue_to_userSays: t.coachWaitMs,
+      recMs_sttEnd_to_queue: this._replyTraceRecMs(t.sttRecordingEndSec, t.recordingAtQueueSec),
+      recMs_sttEnd_to_wire: this._replyTraceRecMs(t.sttRecordingEndSec, t.wireRecordingStartSec),
+      recMs_speechEnd_to_wire: this._replyTraceRecMs(t.sttSpeechEndSec, t.wireRecordingStartSec)
+    })
+  }
+
+  _logReplyTraceHeard (agentEndRecordingSec) {
+    const t = this._replyTrace
+    if (!t || !_.isFinite(t.sttFinalAtMs)) return
+    const heardSec = t.heardRecordingStartSec
+    const playedSec = t.playedRecordingStartSec
+    if (_.isFinite(agentEndRecordingSec)) {
+      t.agentEndRecordingSec = agentEndRecordingSec
+    }
+    _info('voip_reply_trace_heard', {
+      sessionId: t.sessionId,
+      playedRecordingStartSec: playedSec,
+      heardRecordingStartSec: heardSec,
+      agentEndRecordingSec: t.agentEndRecordingSec,
+      wireRecordingStartSec: t.wireRecordingStartSec,
+      sttRecordingEndSec: t.sttRecordingEndSec,
+      sttSpeechEndSec: t.sttSpeechEndSec,
+      recMs_sttEnd_to_played: this._replyTraceRecMs(t.sttRecordingEndSec, playedSec),
+      recMs_speechEnd_to_played: this._replyTraceRecMs(t.sttSpeechEndSec, playedSec),
+      recMs_sttEnd_to_heard: this._replyTraceRecMs(t.sttRecordingEndSec, heardSec),
+      recMs_sttEnd_to_wire: this._replyTraceRecMs(t.sttRecordingEndSec, t.wireRecordingStartSec),
+      recMs_wire_to_played: this._replyTraceRecMs(t.wireRecordingStartSec, playedSec),
+      recMs_wire_to_heard: this._replyTraceRecMs(t.wireRecordingStartSec, heardSec)
+    })
+    this._replyTrace = null
   }
 
   _voipWsCanSend () {
