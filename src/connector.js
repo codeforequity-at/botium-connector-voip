@@ -251,6 +251,7 @@ class BotiumConnectorVoip {
     this._activeUserSaysVoipAgent = null
     this.audioStream = { format: null, pcmParts: [], totalBytes: 0, complete: false }
     this._turnAudioCounter = 0
+    this._meTurnAudioOrdinal = -1 // 0-based ordinal of REAL user turns this session
     this._lastBotTurnStartSec = null
     if (this.ttsCache) {
       this.ttsCache.clear()
@@ -1235,6 +1236,12 @@ class BotiumConnectorVoip {
     const hasDtmf = !!(msg && msg.buttons && msg.buttons.length > 0)
     const dtmfMatch = msg && msg.messageText && msg.messageText.match(/<DTMF>([^<]+)<\/DTMF>/i)
     const inputType = hasDtmf || dtmfMatch ? 'dtmf' : (hasText && hasVoiceMedia ? 'mixed' : hasText ? 'text' : hasVoiceMedia ? 'media' : 'unknown')
+    // A real user turn is one that sends content (text/media/dtmf). 'unknown' turns send nothing and
+    // surface server-side as skippable me-steps, so they must NOT consume an ordinal slot - this keeps
+    // meTurnIndex aligned with the server's non-skippable me-step indices when placing turn audio.
+    const meTurnIndex = (inputType !== 'unknown')
+      ? (this._meTurnAudioOrdinal = (this._meTurnAudioOrdinal ?? -1) + 1)
+      : null
     const msgPreview = hasText && msg.messageText ? String(msg.messageText).trim().substring(0, 80) : ''
     _info('user_says', {
       sessionId: this.sessionId,
@@ -1486,6 +1493,7 @@ class BotiumConnectorVoip {
                     name: `turn_${this._turnAudioCounter}.wav`,
                     mimeType: 'audio/wav',
                     base64: audioBase64,
+                    meTurnIndex // explicit 0-based real-user-turn ordinal (authoritative for placement)
                   })
                 }
                 this._lastBotTurnStartSec = null
