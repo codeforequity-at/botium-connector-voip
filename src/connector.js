@@ -1304,6 +1304,13 @@ class BotiumConnectorVoip {
             this._sendUserSaysWs(request)
             this._markReplyTrace({ sendAudioAtMs: Date.now() })
             this._logReplyTrace('wire_sent')
+            // Finalize the wall pipeline NOW, while _replyTrace still holds this turn's data
+            // (userSaysAtMs / ttsStartAtMs / ttsEndAtMs / wireAtMs / sendAudioAtMs are all set by
+            // this point). The deferred turn-audio callback runs only after the agent audio is
+            // "heard" on the recording, which nulls _replyTrace (_logReplyTraceHeard); finalizing
+            // there would drop wallPipeline entirely and collapse the reply-delay breakdown into a
+            // single "Audio send" bucket on the UI.
+            this._finalizeWallPipeline(msg.voipAgent)
           }
           // Twilio default: 100 ms tone + 100 ms gap per digit. Drives agent-bar width only.
           const DTMF_AGENT_BAR_MS_PER_DIGIT = DTMF_MS_PER_DIGIT
@@ -1502,7 +1509,8 @@ class BotiumConnectorVoip {
               debug(`UserSays: turn audio slice error: ${err && err.message}`)
             }
             this._activeUserSaysVoipAgent = null
-            this._finalizeWallPipeline(msg.voipAgent)
+            // wallPipeline is finalized synchronously in sendAgentWire (while _replyTrace is still
+            // alive); by this deferred point _replyTrace may already be nulled by _logReplyTraceHeard.
             resolve()
           }
 
