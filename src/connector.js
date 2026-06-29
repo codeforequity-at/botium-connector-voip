@@ -101,6 +101,8 @@ const Capabilities = {
   VOIP_ICE_TURN_PROTOCOL: 'VOIP_ICE_TURN_PROTOCOL',
   VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 'VOIP_WEBSOCKET_CONNECT_MAXRETRIES',
   VOIP_WEBSOCKET_CONNECT_TIMEOUT: 'VOIP_WEBSOCKET_CONNECT_TIMEOUT',
+  VOIP_CALL_SETUP_RETRY_487_MAXRETRIES: 'VOIP_CALL_SETUP_RETRY_487_MAXRETRIES',
+  VOIP_CALL_SETUP_RETRY_487_TIMEOUT: 'VOIP_CALL_SETUP_RETRY_487_TIMEOUT',
   VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_ENABLE',
   VOIP_SILENCE_DURATION_TIMEOUT: 'VOIP_SILENCE_DURATION_TIMEOUT',
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: 'VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE',
@@ -129,6 +131,10 @@ const Defaults = {
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
   VOIP_WEBSOCKET_CONNECT_TIMEOUT: 4000,
   VOIP_WEBSOCKET_CONNECT_MAXRETRIES: 5,
+  // Retry the whole call setup when the SIP peer terminates the INVITE with a
+  // transient '487 Request Terminated' before the call connects.
+  VOIP_CALL_SETUP_RETRY_487_MAXRETRIES: 2,
+  VOIP_CALL_SETUP_RETRY_487_TIMEOUT: 2000,
   VOIP_SILENCE_DURATION_TIMEOUT: 2500,
   VOIP_SILENCE_DURATION_TIMEOUT_ENABLE: false,
   VOIP_SILENCE_DURATION_TIMEOUT_START: 1000,
@@ -535,13 +541,17 @@ class BotiumConnectorVoip {
         await connectHttp(retryIndex + 1)
       }
     }
-    await connectHttp()
-    if (httpInitRetries > 0) {
-      _info('connected_after_retries', { phase: 'initCall', retries: httpInitRetries })
-    }
-
     return new Promise((resolve, reject) => {
-      const wsEndpoint = `${this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_URL : this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
+      // Worker session details (port) come from connectHttp() and are recomputed
+      // on every (re)try, since each setup attempt gets a fresh worker session.
+      let wsEndpoint = null
+      const computeWsEndpoint = () => `${this.caps[Capabilities.VOIP_USE_GLOBAL_VOIP_WORKER] ? process.env.BOTIUM_VOIP_WORKER_URL : this.caps[Capabilities.VOIP_WORKER_URL]}/ws/${data.port}`
+      // 487-retry bookkeeping: a transient '487 Request Terminated' that arrives
+      // before the call connects re-runs the whole setup (fresh initCall -> ws
+      // -> SIP INVITE) up to max487Retries times.
+      let setup487Retries = 0
+      let convoStepListenerAttached = false
+      const max487Retries = this.caps[Capabilities.VOIP_CALL_SETUP_RETRY_487_MAXRETRIES]
       const connectWs = (retryIndex) => {
         retryIndex = retryIndex || 0
         return new Promise((resolve, reject) => {
@@ -581,7 +591,7 @@ class BotiumConnectorVoip {
           })
         })
       }
-      connectWs().then((wsRetries) => {
+      const onWsConnected = (wsRetries) => {
         if (wsRetries > 0) {
           _info('connected_after_retries', { phase: 'websocket', retries: wsRetries })
         }
@@ -593,26 +603,31 @@ class BotiumConnectorVoip {
           }
         }
 
-        this.eventEmitter.on('CONVO_STEP_NEXT', (container, convoStep) => {
-          this.convoStep = convoStep
-          this._maybePrefetchTts(convoStep)
-          // For PSST: send join silence duration per step to VOIP worker (controls PSST silence trigger)
-          try {
-            if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' && this.ws && this.ws.readyState === WebSocket.OPEN) {
-              const silenceMs = this._getEffectiveJoinTimeoutMs(convoStep, this.botMsgs)
-              if (_.isFinite(silenceMs) && silenceMs > 0 && this.sessionId) {
-                debug(`PSST: sending silenceDurationMs=${silenceMs} for sessionId=${this.sessionId}`)
-                this.ws.send(JSON.stringify({
-                  METHOD: 'setSttSilenceDuration',
-                  sessionId: this.sessionId,
-                  silenceDurationMs: silenceMs
-                }))
+        // Attach this once: the listener reads this.ws dynamically, so it keeps
+        // working across 487 setup retries that swap out the websocket.
+        if (!convoStepListenerAttached) {
+          convoStepListenerAttached = true
+          this.eventEmitter.on('CONVO_STEP_NEXT', (container, convoStep) => {
+            this.convoStep = convoStep
+            this._maybePrefetchTts(convoStep)
+            // For PSST: send join silence duration per step to VOIP worker (controls PSST silence trigger)
+            try {
+              if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'PSST' && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                const silenceMs = this._getEffectiveJoinTimeoutMs(convoStep, this.botMsgs)
+                if (_.isFinite(silenceMs) && silenceMs > 0 && this.sessionId) {
+                  debug(`PSST: sending silenceDurationMs=${silenceMs} for sessionId=${this.sessionId}`)
+                  this.ws.send(JSON.stringify({
+                    METHOD: 'setSttSilenceDuration',
+                    sessionId: this.sessionId,
+                    silenceDurationMs: silenceMs
+                  }))
+                }
               }
+            } catch (err) {
+              debug(`Failed sending PSST silence duration to VOIP worker: ${err.message || err}`)
             }
-          } catch (err) {
-            debug(`Failed sending PSST silence duration to VOIP worker: ${err.message || err}`)
-          }
-        })
+          })
+        }
 
         this.silence = null
         this.msgCount = 0
@@ -875,6 +890,9 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'connected') {
+            // Mark connected so a later terminal error is delivered to the bot
+            // conversation instead of triggering a (now pointless) setup retry.
+            this.connected = true
             _info('callinfo_connected', { sessionId: this.sessionId })
             resolve()
           }
@@ -906,6 +924,18 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'error') {
+            const errMsg = parsedData.message || ''
+            // The worker reports the SIP code inside the message string
+            // ("Disconnected because of error - Reason: 487 Request Terminated")
+            // and does not set a dedicated `code` field, so detect 487 from both.
+            const is487 = parsedData.code === 487 || parsedData.code === '487' || /\b487\b/.test(errMsg) || /request terminated/i.test(errMsg)
+            // A transient '487 Request Terminated' that arrives before the call
+            // connects: retry the whole call setup instead of failing the test.
+            if (is487 && !this.connected && setup487Retries < max487Retries) {
+              _info('ws_error_msg', { sessionId: this.sessionId, message: parsedData.message || null, code: parsedData.code || null, retrying487: true })
+              retryCallSetup487(errMsg)
+              return
+            }
             flushPendingBotMsgs('error')
             // Ensure buffered recording is not lost on terminal worker errors.
             this._emitBufferedFullRecordIfAny('error_buffered')
@@ -1223,9 +1253,44 @@ class BotiumConnectorVoip {
             }
           }
         })
-      }).catch(err => {
-        reject(new Error('Error: ' + err))
-      })
+      }
+
+      const retryCallSetup487 = (reasonMessage) => {
+        setup487Retries++
+        _info('call_setup_retry_487', { sessionId: this.sessionId, attempt: setup487Retries, max: max487Retries, reason: reasonMessage || null })
+        debug(`Call setup 487 retry ${setup487Retries}/${max487Retries}: ${reasonMessage}`)
+        // Tear down the dead websocket so its stale handlers cannot fire while
+        // the next attempt establishes a fresh worker session.
+        try {
+          if (this.ws) {
+            this.ws.removeAllListeners()
+            this.ws.terminate()
+          }
+        } catch (err) {
+          debug(`Call setup 487 retry: websocket teardown failed: ${err && err.message}`)
+        }
+        this.ws = null
+        this.wsOpened = false
+        this.end = false
+        setTimeout(() => {
+          establishCall().catch(err => reject(new Error('Error: ' + err)))
+        }, this.caps[Capabilities.VOIP_CALL_SETUP_RETRY_487_TIMEOUT])
+      }
+
+      const establishCall = async () => {
+        // Each (re)try gets a fresh worker session: new initCall -> new port ->
+        // new websocket -> new SIP INVITE.
+        httpInitRetries = 0
+        await connectHttp()
+        if (httpInitRetries > 0) {
+          _info('connected_after_retries', { phase: 'initCall', retries: httpInitRetries })
+        }
+        wsEndpoint = computeWsEndpoint()
+        const wsRetries = await connectWs()
+        onWsConnected(wsRetries)
+      }
+
+      establishCall().catch(err => reject(new Error('Error: ' + err)))
     })
   }
 
