@@ -953,11 +953,11 @@ class BotiumConnectorVoip {
                 sampleRate: parsedData.sampleRate,
                 channels: parsedData.channels,
                 bitsPerSample: parsedData.bitsPerSample,
-                dataOffset: parsedData.dataOffset,
+                dataOffset: parsedData.dataOffset
               },
               pcmParts: [],
               totalBytes: 0,
-              complete: false,
+              complete: false
             }
             debug(`${this.sessionId} - audioStreamStart sampleRate=${parsedData.sampleRate} channels=${parsedData.channels} bitsPerSample=${parsedData.bitsPerSample}`)
           }
@@ -2430,8 +2430,8 @@ class BotiumConnectorVoip {
     header.writeUInt32LE(36 + dataSize, 4)
     header.write('WAVE', 8)
     header.write('fmt ', 12)
-    header.writeUInt32LE(16, 16)          // fmt chunk size
-    header.writeUInt16LE(1, 20)           // PCM format
+    header.writeUInt32LE(16, 16) // fmt chunk size
+    header.writeUInt16LE(1, 20) // PCM format
     header.writeUInt16LE(channels, 22)
     header.writeUInt32LE(sampleRate, 24)
     header.writeUInt32LE(byteRate, 28)
