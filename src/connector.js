@@ -259,6 +259,16 @@ class BotiumConnectorVoip {
     this._turnAudioCounter = 0
     this._meTurnAudioOrdinal = -1 // 0-based ordinal of REAL user turns this session
     this._lastBotTurnStartSec = null
+    // Per-turn audio is NOT sliced inline (that would force UserSays to wait for the
+    // recording to catch up with playback). Instead each turn records a lightweight
+    // descriptor here; slices are cut and emitted as MESSAGE_ATTACHMENT progressively,
+    // as soon as the recording buffer has reached each turn's playback end (so the live
+    // UI can show them mid-run), with a forced flush at session end for any remainder.
+    // Zero added latency for TTS and DTMF turns.
+    this._pendingTurnAudio = []
+    this._turnAudioPrevEndSec = null
+    this._turnAudioForceDone = false
+    this._trailingBotAudioEmitted = false
     if (this.ttsCache) {
       this.ttsCache.clear()
     }
@@ -968,6 +978,9 @@ class BotiumConnectorVoip {
                 this.audioStream.pcmParts.push(buf)
                 this.audioStream.totalBytes += buf.length
                 this._maybeDetectAgentAudibleOnRecording(this._activeUserSaysVoipAgent)
+                // Emit any per-turn audio whose playback the recording has now caught up to,
+                // so the live transcript can show it mid-run (no UserSays latency).
+                this._emitReadyTurnAudio('audioStreamChunk', false)
               } catch (e) {
                 debug(`${this.sessionId} - audioStreamChunk decode error: ${e && e.message}`)
               }
@@ -978,6 +991,8 @@ class BotiumConnectorVoip {
               this.audioStream.complete = true
             }
             debug(`${this.sessionId} - audioStreamEnd totalBytes=${parsedData.totalBytes}`)
+            // Buffer is complete — cut and emit the per-turn audio now.
+            this._flushPendingTurnAudio('audioStreamEnd')
           }
 
           // Full record streaming support:
@@ -995,6 +1010,9 @@ class BotiumConnectorVoip {
             const base64Len = (this.fullRecord || tail || '').length
             emitFullRecordAttachment(this.fullRecord || tail)
             _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecordEnd', base64Len })
+            // Emit per-turn audio before `this.end = true` so it is captured by the
+            // worker before Stop() resolves (no-op if audioStreamEnd already flushed).
+            this._flushPendingTurnAudio('fullRecordEnd')
             // Flush before `this.end = true` so the buffered final STT is not
             // dropped when Stop() clears the PSST silence timer on teardown.
             flushPendingBotMsgs('fullRecordEnd')
@@ -1024,9 +1042,20 @@ class BotiumConnectorVoip {
               if (_.isFinite(heardSec)) {
                 if (playbackData.wireKind === 'dtmf') {
                   active.heardRecordingStartSec = heardSec
+                  this._markReplyTrace({ heardRecordingStartSec: heardSec })
                 }
                 debug(`${this.sessionId} - agent audible on recording at ${heardSec}s (played=${playedSec}s)`)
               }
+              // Log the heard reply-trace now that playback is audible — earlier than the
+              // old turn-audio callback and free of the next-turn _replyTrace race. The
+              // agent's end on the recording = played + playback length.
+              const playbackSec = _.isFinite(active.playbackRequestedDurationMs) && active.playbackRequestedDurationMs > 0
+                ? active.playbackRequestedDurationMs / 1000
+                : (playbackData.wireKind === 'dtmf'
+                  ? this._dtmfPlaybackSec(active, active.digitCount || 1)
+                  : null)
+              const agentEndSec = _.isFinite(playbackSec) ? playedSec + playbackSec : undefined
+              this._logReplyTraceHeard(agentEndSec)
             }
           }
 
@@ -1360,6 +1389,11 @@ class BotiumConnectorVoip {
               wireKind,
               requestedDurationMs: Math.max(0, Math.round(requestedDurationMs || 0)),
               ...(wireRecordingStartSec != null ? { wireRecordingStartSec } : {}),
+              // Carry the coach's reply-decision trace (set on the outgoing message before UserSays)
+              // into voipAgent here, while we own the object and before MESSAGE_SENTTOBOT fires — so
+              // the LIVE transcript snapshot (a deep copy taken at that event) already has it, not
+              // just the final result. Lets the UI split "Tester reply decision" live.
+              ...(msg && msg.coachTrace && typeof msg.coachTrace === 'object' ? { coachTrace: msg.coachTrace } : {}),
               ...extras
             }
             this._activeUserSaysVoipAgent = msg.voipAgent
@@ -1520,83 +1554,15 @@ class BotiumConnectorVoip {
             }
           }
           const requestedDurationMs = Math.max(0, Math.round((duration || 0) * 1000))
-          const isDtmfTurn = msg.voipAgent && msg.voipAgent.wireKind === 'dtmf'
 
-          // After the TTS/media finishes playing, slice the full turn audio
-          // (bot spoke first + me just finished) and attach it to this me-step.
-          const attachTurnAudioAndResolve = (endSecOverride) => {
-            try {
-              const fmt = this.audioStream && this.audioStream.format
-              const bytesPerSec = fmt ? fmt.sampleRate * fmt.channels * (fmt.bitsPerSample / 8) : null
-              const endSec = _.isFinite(endSecOverride)
-                ? endSecOverride
-                : ((bytesPerSec && this.audioStream && this.audioStream.totalBytes > 0)
-                  ? this.audioStream.totalBytes / bytesPerSec
-                  : null)
-              if (msg.voipAgent) {
-                const heardSec = msg.voipAgent.wireKind === 'dtmf' && _.isFinite(msg.voipAgent.playedRecordingStartSec)
-                  ? msg.voipAgent.playedRecordingStartSec
-                  : this._applyAgentHeardRecordingStartSec(msg.voipAgent, msg.attachments)
-                if (!_.isFinite(heardSec) && _.isFinite(endSec) && requestedDurationMs > 0) {
-                  const requestedSec = msg.voipAgent.wireKind === 'dtmf'
-                    ? this._dtmfPlaybackSec(msg.voipAgent, msg.voipAgent.digitCount || 1)
-                    : (requestedDurationMs / 1000)
-                  const fromEnd = Math.max(0, endSec - requestedSec)
-                  const wireSec = msg.voipAgent.wireRecordingStartSec
-                  msg.voipAgent.heardRecordingStartSec = _.isFinite(wireSec)
-                    ? Math.max(wireSec, fromEnd)
-                    : fromEnd
-                } else if (_.isFinite(heardSec) && !_.isFinite(msg.voipAgent.heardRecordingStartSec)) {
-                  msg.voipAgent.heardRecordingStartSec = heardSec
-                }
-              }
-              if (msg.voipAgent && _.isFinite(msg.voipAgent.heardRecordingStartSec)) {
-                this._markReplyTrace({ heardRecordingStartSec: msg.voipAgent.heardRecordingStartSec })
-              }
-              this._logReplyTraceHeard(endSec)
-              if (this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE] && _.isFinite(this._lastBotTurnStartSec) && _.isFinite(endSec) && endSec > this._lastBotTurnStartSec) {
-                // The real DTMF tone is mixed into full_record by the worker and arrives via the
-                // audioStream tail, so the per-turn slice already contains it (the slice end waits for
-                // the DTMF tail via _waitForDtmfTurnEndSec). No synthesized tone is injected.
-                const audioBase64 = this._sliceTurnAudio(this._lastBotTurnStartSec, endSec)
-                if (audioBase64) {
-                  this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
-                  msg.attachments.push({
-                    name: `turn_${this._turnAudioCounter}.wav`,
-                    mimeType: 'audio/wav',
-                    base64: audioBase64,
-                    meTurnIndex // explicit 0-based real-user-turn ordinal (authoritative for placement)
-                  })
-                }
-                this._lastBotTurnStartSec = null
-              }
-            } catch (err) {
-              debug(`UserSays: turn audio slice error: ${err && err.message}`)
-            }
-            this._activeUserSaysVoipAgent = null
-            // wallPipeline is finalized synchronously in sendAgentWire (while _replyTrace is still
-            // alive); by this deferred point _replyTrace may already be nulled by _logReplyTraceHeard.
-            resolve()
-          }
-
-          const finalizeUserSays = async () => {
-            let endSecOverride = null
-            if (isDtmfTurn) {
-              const digitCount = msg.voipAgent.digitCount || 1
-              const paddingSec = (this.caps[Capabilities.VOIP_TURN_AUDIO_PADDING_MS] || 0) / 1000
-              const timeoutMs = dtmfTurnAudioWaitMs(digitCount) + 1500
-              endSecOverride = await this._waitForDtmfTurnEndSec(msg.voipAgent, digitCount, paddingSec, timeoutMs)
-            }
-            attachTurnAudioAndResolve(endSecOverride)
-          }
-
-          if (isDtmfTurn) {
-            finalizeUserSays()
-          } else if (requestedDurationMs <= 0) {
-            attachTurnAudioAndResolve()
-          } else {
-            setTimeout(() => attachTurnAudioAndResolve(), requestedDurationMs)
-          }
+          // Record this turn's slice bounds and resolve immediately — the actual
+          // slice is cut from the complete buffer at session end (see
+          // _flushPendingTurnAudio). This keeps UserSays from waiting for the
+          // recording to catch up with playback (no latency for TTS or DTMF). The
+          // heard-trace telemetry (voip_reply_trace_heard) is logged from the
+          // agentPlaybackStarted handler once playback is audible on the recording.
+          this._recordPendingTurnAudio(msg.voipAgent, requestedDurationMs, meTurnIndex)
+          resolve()
         } catch (err) {
           reject(err)
         }
@@ -1611,49 +1577,179 @@ class BotiumConnectorVoip {
     return this.audioStream.totalBytes / bytesPerSec
   }
 
-  /**
-   * Poll audioStream until DTMF PCM has been flushed through audioStream.
-   * Slice end must be derived from playedRecordingStartSec (worker timeline),
-   * not wireRecordingStartSec — the WS send can be hundreds of ms before DTMF
-   * is injected into full_recorder, and silence after bot can satisfy an early
-   * wire-based threshold for single-digit DTMF.
-   */
+  /** Expected on-recording playback length of a DTMF turn (worker-reported, else estimated). */
   _dtmfPlaybackSec (voipAgent, digitCount) {
     const playbackMs = voipAgent && voipAgent.playbackRequestedDurationMs
     if (_.isFinite(playbackMs) && playbackMs > 0) return playbackMs / 1000
     return dtmfPlaybackMs(digitCount) / 1000
   }
 
-  _waitForDtmfTurnEndSec (voipAgent, digitCount, paddingSec, timeoutMs) {
-    const deadline = Date.now() + timeoutMs
-    return new Promise((resolve) => {
-      const tick = () => {
-        const streamEndSec = this._recordingSecNow()
-        const playedSec = voipAgent && voipAgent.playedRecordingStartSec
-        const streamSlackSec = (audioStreamIntervalMs() + 50) / 1000
+  /**
+   * Snapshot the bounds needed to slice this turn's audio later, then return.
+   * `_lastBotTurnStartSec` is the bot-speech anchor; it is consumed here so the
+   * next bot message sets a fresh one. The end of the agent's playback is read
+   * from voipAgent.playedRecordingStartSec (filled asynchronously by the
+   * agentPlaybackStarted handler) at flush time. Consecutive agent turns with no
+   * bot message in between (anchor null) chain off the previous turn's end.
+   */
+  _recordPendingTurnAudio (voipAgent, requestedDurationMs, meTurnIndex) {
+    if (!this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE]) return
+    const botAnchorSec = _.isFinite(this._lastBotTurnStartSec) ? this._lastBotTurnStartSec : null
+    this._lastBotTurnStartSec = null
+    this._pendingTurnAudio.push({
+      botAnchorSec,
+      voipAgent: voipAgent || null,
+      requestedDurationMs: Math.max(0, requestedDurationMs || 0),
+      meTurnIndex: Number.isInteger(meTurnIndex) && meTurnIndex >= 0 ? meTurnIndex : null
+    })
+    _info('turn_audio_recorded', {
+      sessionId: this.sessionId,
+      meTurnIndex,
+      botAnchorSec,
+      wireKind: voipAgent && voipAgent.wireKind,
+      pending: this._pendingTurnAudio.length
+    })
+  }
 
-        if (!_.isFinite(playedSec)) {
-          if (Date.now() >= deadline) {
-            debug(`${this.sessionId} - DTMF turn audio wait timeout without playedRecordingStartSec (digits=${digitCount})`)
-            return resolve(streamEndSec)
+  /**
+   * Emit per-turn audio (turn_N.wav) for every pending turn whose playback end the
+   * recording buffer has already reached, slicing from the live buffer and emitting a
+   * MESSAGE_ATTACHMENT carrying meTurnIndex. Turns are processed in order (the chain
+   * start of a follow-up turn with no bot anchor depends on the previous turn's end), so
+   * a not-yet-ready turn stops the pass until more audio streams in. With force=true
+   * (session end) the remainder is emitted even if the buffer is incomplete.
+   */
+  _emitReadyTurnAudio (reason, force) {
+    if (!this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE]) return
+    const pending = this._pendingTurnAudio || []
+    if (!pending.length) return
+    if (!this.audioStream || !this.audioStream.format) return // no PCM yet
+    const slackSec = (audioStreamIntervalMs() + 50) / 1000
+    const recNow = this._recordingSecNow()
+    for (const t of pending) {
+      if (t.emitted) continue
+      try {
+        const va = t.voipAgent || {}
+        const playbackSec = va.wireKind === 'dtmf'
+          ? this._dtmfPlaybackSec(va, va.digitCount || 1)
+          : (_.isFinite(va.playbackRequestedDurationMs) && va.playbackRequestedDurationMs > 0
+            ? va.playbackRequestedDurationMs / 1000
+            : t.requestedDurationMs / 1000)
+        const startSec = _.isFinite(t.botAnchorSec) ? t.botAnchorSec : this._turnAudioPrevEndSec
+        // End = where the agent's playback finished on the recording. _sliceTurnAudio
+        // adds the configured padding on top.
+        const anchorSec = _.isFinite(va.playedRecordingStartSec)
+          ? va.playedRecordingStartSec
+          : (_.isFinite(va.heardRecordingStartSec)
+            ? va.heardRecordingStartSec
+            : (_.isFinite(va.wireRecordingStartSec) ? va.wireRecordingStartSec : null))
+        let endSec = _.isFinite(anchorSec) ? anchorSec + playbackSec : null
+        if (!_.isFinite(endSec) && _.isFinite(startSec)) endSec = startSec + playbackSec
+
+        // Progressive: only emit once the recording has reached this turn's end (plus a
+        // stream-flush slack). Stop the pass otherwise — later turns must wait their turn.
+        if (!force) {
+          if (!_.isFinite(anchorSec) || !_.isFinite(endSec)) break
+          if (!_.isFinite(recNow) || recNow < endSec + slackSec) break
+        }
+
+        if (!_.isFinite(startSec) || !_.isFinite(endSec) || endSec <= startSec) {
+          debug(`${this.sessionId} - turnAudio: skip turn (start=${startSec} end=${endSec} reason=${reason})`)
+          t.emitted = true
+          if (_.isFinite(endSec)) this._turnAudioPrevEndSec = endSec
+          continue
+        }
+        const audioBase64 = this._sliceTurnAudio(startSec, endSec)
+        t.emitted = true
+        this._turnAudioPrevEndSec = endSec
+        if (!audioBase64) continue
+        this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
+        this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
+          name: `turn_${this._turnAudioCounter}.wav`,
+          mimeType: 'audio/wav',
+          base64: audioBase64,
+          meTurnIndex: t.meTurnIndex, // 0-based real-user-turn ordinal (authoritative for placement)
+          sessionContext: {
+            testSessionId: this.caps.VOIP_TEST_SESSION_ID || null,
+            testSessionJobId: this.caps.VOIP_TEST_SESSION_JOB_ID || null
           }
-          return setTimeout(tick, 50)
-        }
-
-        const dtmfSec = this._dtmfPlaybackSec(voipAgent, digitCount)
-        const minEndSec = playedSec + dtmfSec + paddingSec + streamSlackSec
-
-        if (_.isFinite(streamEndSec) && streamEndSec >= minEndSec) {
-          debug(`${this.sessionId} - DTMF turn audio ready at ${streamEndSec.toFixed(3)}s (played=${playedSec.toFixed(3)}s need=${minEndSec.toFixed(3)}s digits=${digitCount} dtmfSec=${dtmfSec.toFixed(3)})`)
-          return resolve(streamEndSec)
-        }
-        if (Date.now() >= deadline) {
-          debug(`${this.sessionId} - DTMF turn audio wait timeout at ${streamEndSec != null ? streamEndSec.toFixed(3) : 'null'}s (played=${playedSec.toFixed(3)}s need=${minEndSec.toFixed(3)}s digits=${digitCount})`)
-          return resolve(streamEndSec)
-        }
-        setTimeout(tick, 50)
+        })
+        _info('turn_audio_emitted', {
+          sessionId: this.sessionId,
+          name: `turn_${this._turnAudioCounter}.wav`,
+          meTurnIndex: t.meTurnIndex,
+          startSec: Number(startSec.toFixed(2)),
+          endSec: Number(endSec.toFixed(2)),
+          reason
+        })
+      } catch (err) {
+        debug(`${this.sessionId} - emitReadyTurnAudio: turn slice error: ${err && err.message}`)
       }
-      tick()
+    }
+  }
+
+  /**
+   * Force-emit any per-turn audio not yet sent (session end). Idempotent.
+   */
+  _flushPendingTurnAudio (reason) {
+    if (this._turnAudioForceDone) return
+    this._turnAudioForceDone = true
+    const pending = this._pendingTurnAudio || []
+    _info('turn_audio_flush_enter', {
+      sessionId: this.sessionId,
+      reason,
+      pending: pending.length,
+      emittedAlready: pending.filter(t => t.emitted).length,
+      hasFormat: !!(this.audioStream && this.audioStream.format),
+      totalBytes: this.audioStream && this.audioStream.totalBytes,
+      turnAudioEnable: !!this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE]
+    })
+    this._emitReadyTurnAudio(reason, true)
+    this._emitTrailingBotAudio(reason)
+    _info('turn_audio_flush_done', { sessionId: this.sessionId, reason, emitted: this._turnAudioCounter || 0, pending: pending.length })
+  }
+
+  /**
+   * If the call ended on a bot turn (a bot message arrived with no me-response after it),
+   * `_lastBotTurnStartSec` was never consumed by a turn. Slice that trailing bot audio
+   * (bot start → end of recording) and emit it as a turn clip flagged `trailingBot` so the
+   * UI/server place it on the final bot step.
+   */
+  _emitTrailingBotAudio (reason) {
+    if (!this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE]) return
+    if (this._trailingBotAudioEmitted) return
+    const startSec = _.isFinite(this._lastBotTurnStartSec) ? this._lastBotTurnStartSec : null
+    if (!_.isFinite(startSec)) return
+    if (!this.audioStream || !this.audioStream.format) return
+    const endSec = this._recordingSecNow()
+    if (!_.isFinite(endSec) || endSec <= startSec) return
+    let audioBase64 = null
+    try {
+      audioBase64 = this._sliceTurnAudio(startSec, endSec)
+    } catch (err) {
+      debug(`${this.sessionId} - emitTrailingBotAudio: slice error: ${err && err.message}`)
+      return
+    }
+    if (!audioBase64) return
+    this._trailingBotAudioEmitted = true
+    this._lastBotTurnStartSec = null
+    this._turnAudioCounter = (this._turnAudioCounter || 0) + 1
+    this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
+      name: `turn_${this._turnAudioCounter}.wav`,
+      mimeType: 'audio/wav',
+      base64: audioBase64,
+      trailingBot: true, // place on the final bot step (no me-response followed)
+      sessionContext: {
+        testSessionId: this.caps.VOIP_TEST_SESSION_ID || null,
+        testSessionJobId: this.caps.VOIP_TEST_SESSION_JOB_ID || null
+      }
+    })
+    _info('turn_audio_trailing_emitted', {
+      sessionId: this.sessionId,
+      name: `turn_${this._turnAudioCounter}.wav`,
+      startSec: Number(startSec.toFixed(2)),
+      endSec: Number(endSec.toFixed(2)),
+      reason
     })
   }
 
@@ -2045,6 +2141,8 @@ class BotiumConnectorVoip {
       if (typeof this._emitBufferedFullRecordIfAny === 'function') {
         this._emitBufferedFullRecordIfAny('stop_final_guard')
       }
+      // Last-resort flush in case neither audioStreamEnd nor fullRecordEnd fired.
+      this._flushPendingTurnAudio('stop_final_guard')
     }
     this._emitBufferedFullRecordIfAny = null
   }
