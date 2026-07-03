@@ -67,6 +67,7 @@ const Capabilities = {
   VOIP_STT_MESSAGE_HANDLING: 'VOIP_STT_MESSAGE_HANDLING',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT: 'VOIP_STT_MESSAGE_HANDLING_TIMEOUT_SUBSEQUENT',
+  VOIP_STT_MESSAGE_HANDLING_LATENCY_GRACE_MS: 'VOIP_STT_MESSAGE_HANDLING_LATENCY_GRACE_MS',
   VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING: 'VOIP_JOIN_SILENCE_DURATION_BY_SUBSTRING',
   VOIP_STT_DICTIONARY_REPLACEMENTS: 'VOIP_STT_DICTIONARY_REPLACEMENTS',
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER',
@@ -127,6 +128,10 @@ const Defaults = {
   VOIP_TTS_PREFETCH_ENABLE: true,
   VOIP_STT_MESSAGE_HANDLING: 'ORIGINAL',
   VOIP_STT_MESSAGE_HANDLING_TIMEOUT: 2500,
+  // Extra wall-clock grace added to the JOIN/PSST flush window when the last buffered final was
+  // cut mid-utterance (no Azure-detected end-of-speech silence). Absorbs STT delivery latency so a
+  // paused-then-resumed prompt is joined instead of split. Set to 0 to disable. See _getPsstLatencyGraceMs.
+  VOIP_STT_MESSAGE_HANDLING_LATENCY_GRACE_MS: 1500,
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: '. ',
   VOIP_STT_MESSAGE_HANDLING_PUNCTUATION: '.!?',
   VOIP_WEBSOCKET_CONNECT_TIMEOUT: 4000,
@@ -366,26 +371,38 @@ class BotiumConnectorVoip {
       const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
       if (!isJoinMethod) return
       const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep, this.botMsgs)
+      // Variant-3 latency grace: when the last buffered final was cut mid-utterance (no
+      // Azure-detected end-of-speech silence) a continuation is plausible but its STT delivery
+      // lags behind the audio by ~1s. Extend the wall-clock flush window by the grace so the
+      // resumed segment's partial/final (or a worker speechResumed event) can re-arm this timer
+      // and be joined, instead of flushing the first fragment on its own. A natural-ended final
+      // keeps the base window and flushes fast.
+      const graceMs = this._getPsstLatencyGraceMs()
+      const graceApplied = graceMs > 0 && _.isFinite(joinTimeoutMs) && joinTimeoutMs > 0 && !this._isLastFinalNaturalEnd()
+      const effectiveWindowMs = graceApplied ? (joinTimeoutMs + graceMs) : (joinTimeoutMs || 0)
       if (this.silenceTimeout) {
         clearTimeout(this.silenceTimeout)
         this.silenceTimeout = null
       }
       const bufferedAtArm = this.botMsgs.length
       const armedAt = Date.now()
-      this._markReplyTrace({ psstTimerArmedAtMs: armedAt, psstScheduledMs: joinTimeoutMs || 0 })
+      this._markReplyTrace({ psstTimerArmedAtMs: armedAt, psstScheduledMs: effectiveWindowMs || 0 })
       _info('psst_timer_armed', {
         sessionId: this.sessionId,
-        joinTimeoutMs: joinTimeoutMs || 0,
+        joinTimeoutMs: effectiveWindowMs || 0,
+        baseTimeoutMs: joinTimeoutMs || 0,
+        graceMs: graceApplied ? graceMs : 0,
+        graceApplied,
         bufferedChunks: bufferedAtArm,
         stopCalled: !!this.stopCalled
       })
-      // Emit the authoritative join timeout so downstream consumers (e.g.
+      // Emit the authoritative flush window so downstream consumers (e.g.
       // SpeculationBuffer) can size their quiet threshold relative to it.
-      if (this.eventEmitter && _.isFinite(joinTimeoutMs) && joinTimeoutMs > 0) {
+      if (this.eventEmitter && _.isFinite(effectiveWindowMs) && effectiveWindowMs > 0) {
         try {
           this.eventEmitter.emit('voip.psstTimerArmed', {
             sessionId: this.sessionId,
-            joinTimeoutMs,
+            joinTimeoutMs: effectiveWindowMs,
             bufferedChunks: bufferedAtArm,
             armedAt
           })
@@ -402,10 +419,11 @@ class BotiumConnectorVoip {
             sessionId: this.sessionId,
             bufferedChunks: this.botMsgs.length,
             actualDelayMs: fireDelay,
-            scheduledDelayMs: joinTimeoutMs || 0,
+            scheduledDelayMs: effectiveWindowMs || 0,
+            graceApplied,
             outcome: 'emit'
           })
-          debug('Silence Duration Timeout (JOIN/PSST):', joinTimeoutMs, 'ms')
+          debug('Silence Duration Timeout (JOIN/PSST):', effectiveWindowMs, 'ms')
           sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
           this.firstMsg = false
           this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
@@ -418,11 +436,11 @@ class BotiumConnectorVoip {
             sessionId: this.sessionId,
             bufferedChunks: 0,
             actualDelayMs: fireDelay,
-            scheduledDelayMs: joinTimeoutMs || 0,
+            scheduledDelayMs: effectiveWindowMs || 0,
             outcome: 'noop_empty_buffer'
           })
         }
-      }, joinTimeoutMs || 0)
+      }, effectiveWindowMs || 0)
     }
 
     // Flush buffered STT chunks on teardown so a late final is not lost when
@@ -1065,6 +1083,35 @@ class BotiumConnectorVoip {
                 flushPendingBotMsgs('silence_exceeded')
                 this.end = true
                 sendBotMsg(new Error(`Silence Duration of ${parsedData.data.silence[0][2].toFixed(2)}s exceeded General Silence Duration Timeout of ${this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] / 1000}s`))
+              }
+            }
+          }
+
+          if (parsedData && parsedData.type === 'speech' && parsedData.event === 'onSpeechResumed') {
+            // Positive VAD signal from the worker: the bot started speaking again after a pause.
+            // It arrives ~1s before the resumed segment's first STT partial, so when we are
+            // buffering finals (PSST/JOIN) we re-arm the flush timer now — keeping the buffered
+            // fragment open to be joined instead of flushed on its own. Bounded by the same
+            // extension budget as partial-driven re-arms to prevent infinite stranding.
+            _info('speech_resumed', { sessionId: this.sessionId })
+            const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
+            const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
+            if (isJoinMethod && this.botMsgs && this.botMsgs.length > 0) {
+              const MAX_EXTENSION_MS = 60000
+              const now = Date.now()
+              const withinCap = this.psstFirstRearmAt == null || (now - this.psstFirstRearmAt) < MAX_EXTENSION_MS
+              if (withinCap) {
+                if (this.psstFirstRearmAt == null) this.psstFirstRearmAt = now
+                this.psstRearmCount++
+                _info('psst_timer_extended', {
+                  sessionId: this.sessionId,
+                  rearmCount: this.psstRearmCount,
+                  msSinceFirstRearm: now - this.psstFirstRearmAt,
+                  bufferedChunks: this.botMsgs.length,
+                  reason: 'speech_resumed',
+                  silenceDurationMs: _.get(parsedData, 'data.silenceDurationMs', null)
+                })
+                armJoinSilenceTimer()
               }
             }
           }
@@ -2471,6 +2518,21 @@ class BotiumConnectorVoip {
     const parsed = parseInt(ms, 10)
     if (!_.isFinite(parsed) || parsed <= 0) return null
     return isPsst ? Math.max(0, parsed - 500) : parsed
+  }
+
+  // Extra grace (ms) added to the JOIN/PSST flush window when the last buffered final was cut
+  // mid-utterance. Returns 0 when unset/invalid (feature off). See _isLastFinalNaturalEnd.
+  _getPsstLatencyGraceMs () {
+    const parsed = parseInt(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_LATENCY_GRACE_MS], 10)
+    if (!_.isFinite(parsed) || parsed <= 0) return 0
+    return parsed
+  }
+
+  // A final that carries a finite silenceStartedSec ended on Azure-detected end-of-speech silence
+  // (bot genuinely stopped) => flush at the base window, no grace. A final without it was cut
+  // mid-utterance (forced/segmented) => a continuation is plausible => apply the latency grace.
+  _isLastFinalNaturalEnd () {
+    return _.isFinite(_.get(this.prevData, 'data.silenceStartedSec'))
   }
 
   _getEffectiveJoinTimeoutMs (convoStep, botMsgs) {
