@@ -27,6 +27,12 @@ module.exports = {
         required: false
       },
       {
+        name: 'VOIP_TTS_EFFECTS_PROFILE',
+        label: 'Voice Effect Profile',
+        type: 'speechnoiseprofile',
+        required: false
+      },
+      {
         name: 'VOIP_USER_INPUT_PREFER_VOICE',
         label: 'Prefer voice media when both text and voice present',
         type: 'boolean',
