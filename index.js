@@ -74,6 +74,13 @@ module.exports = {
         type: 'int',
         required: false,
         advanced: true
+      },
+      {
+        name: 'VOIP_WORKER_LOGS_ENABLE',
+        label: 'Forward detailed VoIP worker call logs',
+        type: 'boolean',
+        required: false,
+        advanced: true
       }
     ]
   },
