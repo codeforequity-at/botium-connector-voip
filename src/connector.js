@@ -5,13 +5,14 @@ const http = require('http')
 const https = require('https')
 const debug = require('debug')('botium-connector-voip')
 const mm = require('music-metadata')
+const { formatConnectorInfoLine, formatWorkerLogLine, parseBoolean } = require('./worker-logging')
 
 // Logging policy: info = rare, business-relevant lifecycle events (always visible).
 // debug = high-frequency diagnostics (DEBUG=botium-connector-voip). warn = degraded but continuing.
 // error = abort/failure. No secrets in info; STT text only as length or truncated in info.
 
 /** WS frame types logged only at start/end handlers — not per-chunk (hundreds per call). */
-const WS_DEBUG_SILENT_TYPES = new Set(['audioStreamChunk', 'fullRecordChunk'])
+const WS_DEBUG_SILENT_TYPES = new Set(['audioStreamChunk', 'fullRecordChunk', 'workerLogs'])
 const AGENT_SPEECH_RMS_WINDOW_MS = 100
 const DEFAULT_AGENT_SPEECH_RMS_THRESHOLD = 500
 const DEFAULT_AGENT_SPEECH_SUSTAINED_WINDOWS = 2
@@ -20,10 +21,7 @@ const WS_DEBUG_BASE64_FIELD_NAMES = new Set([
 ])
 
 const _info = (event, data) => {
-  const parts = Object.entries({ event, ...data })
-    .filter(([, v]) => v != null && v !== '')
-    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-  console.info(`[botium-connector-voip] ${parts.join(' ')}`)
+  console.info(formatConnectorInfoLine(event, data))
 }
 
 /** DTMF for RTP/PJSIP: 0–9, *, #, A–D. Strips spaces and other separators so the worker gets one compact string. */
@@ -83,6 +81,7 @@ const Capabilities = {
   VOIP_TTS_PREFETCH_ENABLE: 'VOIP_TTS_PREFETCH_ENABLE',
   VOIP_WORKER_URL: 'VOIP_WORKER_URL',
   VOIP_WORKER_APIKEY: 'VOIP_WORKER_APIKEY',
+  VOIP_WORKER_LOGS_ENABLE: 'VOIP_WORKER_LOGS_ENABLE',
   VOIP_SIP_POOL_CALLER_ENABLE: 'VOIP_SIP_POOL_CALLER_ENABLE',
   VOIP_SIP_CALLER_REGISTRAR_URI: 'VOIP_SIP_CALLER_REGISTRAR_URI',
   VOIP_SIP_CALLER_ADDRESS: 'VOIP_SIP_CALLER_ADDRESS',
@@ -147,6 +146,7 @@ const Defaults = {
   VOIP_STT_CONFIDENCE_THRESHOLD: 0.5,
   VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS: 500,
   VOIP_USE_GLOBAL_VOIP_WORKER: false,
+  VOIP_WORKER_LOGS_ENABLE: false,
   VOIP_SIP_PROTOCOL: 'TCP',
   VOIP_USER_INPUT_PREFER_VOICE: true,
   VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: false,
@@ -255,6 +255,7 @@ class BotiumConnectorVoip {
     this.fullRecordAttachmentEmitted = false
     this.end = false
     this.connected = false
+    this.sipCallId = null
     this.convoStep = null
     this._lastBotSaysQueuedAt = null
     this._lastBotSaysText = null
@@ -706,6 +707,7 @@ class BotiumConnectorVoip {
           MIN_SILENCE_DURATION: this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT_ENABLE] ? this.caps[Capabilities.VOIP_SILENCE_DURATION_TIMEOUT] : null,
           SDP_MEDIA_TYPE_TEXT_ENABLE: !!this.caps[Capabilities.VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE],
           AUDIO_STREAM: !!this.caps[Capabilities.VOIP_TURN_AUDIO_ENABLE],
+          WORKER_LOGS_ENABLE: parseBoolean(this.caps[Capabilities.VOIP_WORKER_LOGS_ENABLE]),
           STT_LEGACY: sttLegacy,
           STT_CONFIG: {
             stt_url: sttUrl,
@@ -731,7 +733,8 @@ class BotiumConnectorVoip {
           sipProxy: request.SIP_PROXY || null,
           iceEnable: request.ICE_ENABLE,
           sttUrl: request.STT_CONFIG && request.STT_CONFIG.stt_url,
-          ttsUrl: request.TTS_CONFIG && request.TTS_CONFIG.tts_url
+          ttsUrl: request.TTS_CONFIG && request.TTS_CONFIG.tts_url,
+          workerLogsEnable: request.WORKER_LOGS_ENABLE
         })
         debug(JSON.stringify(request, null, 2))
         this.ws.send(JSON.stringify(request))
@@ -779,7 +782,7 @@ class BotiumConnectorVoip {
           // (fullRecord*) and hard errors so `full_record.wav` is delivered
           // on early-completion hangups. Post-Stop STT frames remain blocked.
           if (this.stopCalled) {
-            const allowedPostStopTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error', 'audioStreamStart', 'audioStreamChunk', 'audioStreamEnd']
+            const allowedPostStopTypes = ['fullRecord', 'fullRecordStart', 'fullRecordChunk', 'fullRecordEnd', 'error', 'audioStreamStart', 'audioStreamChunk', 'audioStreamEnd', 'workerLogs']
             if (!parsedData || !allowedPostStopTypes.includes(parsedData.type)) {
               debug(`${this.sessionId} - Stop already called, ignoring incoming message`)
               return
@@ -899,11 +902,34 @@ class BotiumConnectorVoip {
               sessionId: this.sessionId,
               sttHandling: this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
             })
+            if (parseBoolean(this.caps[Capabilities.VOIP_WORKER_LOGS_ENABLE]) && parsedData.voipConfig.workerLogsEnabled !== true) {
+              _info('worker_logs_unsupported', {
+                sessionId: this.sessionId,
+                message: 'VOIP worker did not acknowledge WORKER_LOGS_ENABLE; continuing without forwarded worker logs'
+              })
+            }
           }
 
           // if sessionId is not the same as the one in the callinfo, return
           if (parsedData && parsedData.voipConfig && parsedData.voipConfig.sessionId && parsedData.voipConfig.sessionId !== this.sessionId) {
             debug('sessionId mismatch, returning')
+            return
+          }
+
+          if (parsedData && parsedData.type === 'workerLogs') {
+            if (!parseBoolean(this.caps[Capabilities.VOIP_WORKER_LOGS_ENABLE])) return
+            if (parsedData.sessionId && this.sessionId && parsedData.sessionId !== this.sessionId) {
+              debug(`Ignoring worker logs for mismatched sessionId=${parsedData.sessionId}`)
+              return
+            }
+            if (!Array.isArray(parsedData.entries)) {
+              _info('worker_logs_invalid_frame', { sessionId: this.sessionId })
+              return
+            }
+            for (const entry of parsedData.entries) {
+              const line = formatWorkerLogLine(entry, this.sessionId || parsedData.sessionId)
+              if (line) console.info(line)
+            }
             return
           }
 
@@ -921,7 +947,15 @@ class BotiumConnectorVoip {
             // Mark connected so a later terminal error is delivered to the bot
             // conversation instead of triggering a (now pointless) setup retry.
             this.connected = true
-            _info('callinfo_connected', { sessionId: this.sessionId })
+            this.sipCallId = parsedData.sipCallId || null
+            _info('callinfo_connected', { sessionId: this.sessionId, sipCallId: this.sipCallId })
+            // Keep the dialog identifier visible as its own searchable lifecycle line,
+            // independently of the detailed worker-log capability.
+            _info('sip_call_id', {
+              sessionId: this.sessionId,
+              sipCallId: this.sipCallId,
+              available: !!this.sipCallId
+            })
             resolve()
           }
 
