@@ -8,7 +8,7 @@
     "build": "npm run eslint && rollup -c",
     "eslint": "eslint index.js src",
     "eslint-fix": "eslint --fix index.js src",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js test/*.spec.js"
   },
   "author": "Botium GmbH",
   "license": "MIT",
