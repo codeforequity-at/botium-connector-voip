@@ -1,4 +1,4 @@
-const BotiumConnectorVoip = require('./src/connector')
+const BotiumConnectorVoip = require('./src/namo-connector')
 const IgnoreSilenceDurationLogicHook = require('./src/ignore-sd-logichook')
 const JoinLogicHook = require('./src/join-logichook')
 const ConfidenceThresholdLogicHook = require('./src/confidence-threshold-logichook')
@@ -85,6 +85,27 @@ module.exports = {
         name: 'VOIP_WORKER_LOGS_ENABLE',
         label: 'Forward detailed VoIP worker call logs',
         type: 'boolean',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_NAMO_EOU_THRESHOLD',
+        label: 'Namo end-of-utterance confidence threshold',
+        type: 'number',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_NAMO_MIN_WAIT_MS',
+        label: 'Namo decision debounce in milliseconds',
+        type: 'int',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_NAMO_MAX_WAIT_MS',
+        label: 'Namo maximum semantic hold in milliseconds',
+        type: 'int',
         required: false,
         advanced: true
       }
