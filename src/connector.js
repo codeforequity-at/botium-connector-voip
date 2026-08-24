@@ -115,6 +115,7 @@ const Capabilities = {
   VOIP_USE_GLOBAL_VOIP_WORKER: 'VOIP_USE_GLOBAL_VOIP_WORKER',
   VOIP_USER_INPUT_PREFER_VOICE: 'VOIP_USER_INPUT_PREFER_VOICE',
   VOIP_EMIT_SPECULATIVE_TEXT: 'VOIP_EMIT_SPECULATIVE_TEXT',
+  VOIP_NO_INPUT_TIMEOUT_MS: 'VOIP_NO_INPUT_TIMEOUT_MS',
   VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE: 'VOIP_SDP_MEDIA_TYPE_TEXT_ENABLE',
   VOIP_TURN_AUDIO_ENABLE: 'VOIP_TURN_AUDIO_ENABLE',
   VOIP_TURN_AUDIO_PADDING_MS: 'VOIP_TURN_AUDIO_PADDING_MS',
@@ -151,6 +152,12 @@ const Defaults = {
   VOIP_SILENCE_DURATION_TIMEOUT_START_ENABLE: false,
   VOIP_STT_CONFIDENCE_THRESHOLD: 0.5,
   VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS: 500,
+  // No-input (music-on-hold) timeout. Read by the agentic runner's per-turn wait as the
+  // idle budget: how long to keep waiting for the next bot message when nothing is arriving.
+  // It is *idle-based* — any bot audio activity (STT partials, or onSpeechResumed VAD ticks
+  // during hold music, see voip.botActivity emissions) resets the clock. So continuous hold
+  // music keeps the call alive; the runner only gives up after audio stops for this long.
+  VOIP_NO_INPUT_TIMEOUT_MS: 60000,
   VOIP_USE_GLOBAL_VOIP_WORKER: false,
   VOIP_WORKER_LOGS_ENABLE: false,
   VOIP_SIP_PROTOCOL: 'TCP',
@@ -1160,6 +1167,24 @@ class BotiumConnectorVoip {
             // fragment open to be joined instead of flushed on its own. Bounded by the same
             // extension budget as partial-driven re-arms to prevent infinite stranding.
             _info('speech_resumed', { sessionId: this.sessionId })
+            // Liveness keep-alive for audio-without-text (e.g. hold music). onSpeechResumed is a
+            // positive VAD signal that audio energy is present even though no STT partial/final has
+            // (or will) arrive. Emitting voip.botActivity here lets the agentic runner's idle-based
+            // no-input timer treat hold music as "still alive" instead of counting it as silence and
+            // hanging up. Fires regardless of whether finals are buffered — the music-on-hold case
+            // has an empty botMsgs buffer, which is exactly when the PSST re-arm below is skipped.
+            if (this.caps[Capabilities.VOIP_EMIT_SPECULATIVE_TEXT] && this.eventEmitter) {
+              try {
+                this.eventEmitter.emit('voip.botActivity', {
+                  sessionId: this.sessionId,
+                  kind: 'speechResumed',
+                  bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0,
+                  silenceDurationMs: _.get(parsedData, 'data.silenceDurationMs', null)
+                })
+              } catch (emitErr) {
+                debug(`voip.botActivity (speechResumed) emission failed: ${emitErr && emitErr.message}`)
+              }
+            }
             const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
             const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
             if (isJoinMethod && this.botMsgs && this.botMsgs.length > 0) {
