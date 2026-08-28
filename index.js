@@ -18,13 +18,20 @@ module.exports = {
         name: 'VOIP_STT',
         label: 'Speech Recognition Profile',
         type: 'speechrecognitionprofile',
-        required: true
+        required: false
       },
       {
         name: 'VOIP_TTS',
         label: 'Speech Synthesis Profile',
         type: 'speechsynthesisprofile',
-        required: true
+        required: false
+      },
+      {
+        name: 'VOIP_TTS_EFFECTS_PROFILE',
+        label: 'Voice Effect Profiles',
+        type: 'speechnoiseprofile',
+        multiple: true,
+        required: false
       },
       {
         name: 'VOIP_USER_INPUT_PREFER_VOICE',

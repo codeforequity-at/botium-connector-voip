@@ -76,6 +76,10 @@ const Capabilities = {
   VOIP_TTS_BODY: 'VOIP_TTS_BODY',
   VOIP_TTS_HEADERS: 'VOIP_TTS_HEADERS',
   VOIP_TTS_TIMEOUT: 'VOIP_TTS_TIMEOUT',
+  VOIP_TTS_EFFECTS_URL: 'VOIP_TTS_EFFECTS_URL',
+  VOIP_TTS_EFFECTS_METHOD: 'VOIP_TTS_EFFECTS_METHOD',
+  VOIP_TTS_EFFECTS_HEADERS: 'VOIP_TTS_EFFECTS_HEADERS',
+  VOIP_TTS_EFFECTS_TIMEOUT: 'VOIP_TTS_EFFECTS_TIMEOUT',
   VOIP_TTS_CACHE_ENABLE: 'VOIP_TTS_CACHE_ENABLE',
   VOIP_TTS_CACHE_SIZE: 'VOIP_TTS_CACHE_SIZE',
   VOIP_TTS_PREFETCH_ENABLE: 'VOIP_TTS_PREFETCH_ENABLE',
@@ -122,6 +126,8 @@ const Defaults = {
   VOIP_STT_TIMEOUT: 10000,
   VOIP_TTS_METHOD: 'GET',
   VOIP_TTS_TIMEOUT: 10000,
+  VOIP_TTS_EFFECTS_METHOD: 'POST',
+  VOIP_TTS_EFFECTS_TIMEOUT: 120000,
   VOIP_TTS_CACHE_ENABLE: true,
   VOIP_TTS_CACHE_SIZE: 50,
   VOIP_TTS_PREFETCH_ENABLE: true,
@@ -238,6 +244,32 @@ class BotiumConnectorVoip {
       } catch (err) {
         throw new Error(`Checking TTS Status failed - ${this._getAxiosErrOutput(err)}`)
       }
+    }
+    if (this.caps[Capabilities.VOIP_TTS_EFFECTS_URL]) {
+      this.axiosTtsEffectsParams = {
+        url: this.caps[Capabilities.VOIP_TTS_EFFECTS_URL],
+        method: this.caps[Capabilities.VOIP_TTS_EFFECTS_METHOD],
+        timeout: this.caps[Capabilities.VOIP_TTS_EFFECTS_TIMEOUT],
+        headers: this._getHeaders(Capabilities.VOIP_TTS_EFFECTS_HEADERS),
+        httpAgent: TTS_HTTP_AGENT,
+        httpsAgent: TTS_HTTPS_AGENT,
+        responseType: 'arraybuffer'
+      }
+      try {
+        const { data } = await axios({
+          ...this.axiosTtsEffectsParams,
+          method: 'GET',
+          url: this._getAxiosUrl(this.caps[Capabilities.VOIP_TTS_EFFECTS_URL], '/api/status'),
+          responseType: 'json'
+        })
+        if (!data || data.status !== 'OK') {
+          throw new Error(`response is: ${this._getAxiosShortenedOutput(data)}`)
+        }
+      } catch (err) {
+        throw new Error(`Checking TTS effects status failed - ${this._getAxiosErrOutput(err)}`)
+      }
+    } else {
+      this.axiosTtsEffectsParams = null
     }
     const cacheSize = parseInt(this.caps[Capabilities.VOIP_TTS_CACHE_SIZE], 10)
     this.ttsCacheEnabled = !!this.caps[Capabilities.VOIP_TTS_CACHE_ENABLE]
@@ -1452,10 +1484,8 @@ class BotiumConnectorVoip {
       setTimeout(async () => {
         try {
           let duration = 0
-          const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
-          const preferVoice = !!preferVoiceCapRaw
-          const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
-          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
+          const skipTtsForMixedInput = hasVoiceMedia
+          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
           // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
           // the coach can place the agent turn on the recording timeline.
@@ -1582,7 +1612,7 @@ class BotiumConnectorVoip {
                   }
                   msg.attachments.push({
                     name: 'tts.wav',
-                    mimeType: 'audio/wav',
+                    mimeType: ttsResult.contentType || 'audio/wav',
                     base64: b64Buffer
                   })
                   stampAgentWire('tts', (duration || 0) * 1000, {
@@ -1595,7 +1625,7 @@ class BotiumConnectorVoip {
                 }
               }
             } else {
-              debug('UserSays routing: skipping TTS for mixed input because VOIP_USER_INPUT_PREFER_VOICE is enabled')
+              debug('UserSays routing: skipping TTS because provided audio takes precedence')
             }
           }
           if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
@@ -2293,7 +2323,8 @@ class BotiumConnectorVoip {
       url: ttsRequest.url,
       method: ttsRequest.method,
       params: ttsRequest.params,
-      data: ttsRequest.data
+      data: ttsRequest.data,
+      effectsUrl: this.axiosTtsEffectsParams && this.axiosTtsEffectsParams.url
     }
     try {
       return JSON.stringify(cacheKeyObj)
@@ -2304,7 +2335,8 @@ class BotiumConnectorVoip {
 
   async _fetchTts (ttsRequest, text) {
     const ttsStart = Date.now()
-    const ttsResponse = await axios(ttsRequest)
+    const axiosClient = this._axios || axios
+    const ttsResponse = await axiosClient(ttsRequest)
     const ttsMs = Date.now() - ttsStart
     const textLen = _.isString(text) ? text.length : 0
     debug(`TTS response ${ttsMs} ms (chars: ${textLen})`)
@@ -2312,10 +2344,31 @@ class BotiumConnectorVoip {
     if (!ttsResponse || !Buffer.isBuffer(ttsResponse.data)) {
       throw new Error(`TTS failed, response is: ${this._getAxiosShortenedOutput(ttsResponse && ttsResponse.data)}`)
     }
-    const durationHeader = ttsResponse.headers && ttsResponse.headers['content-duration']
+    let audioResponse = ttsResponse
+    if (this.axiosTtsEffectsParams) {
+      const effectsStart = Date.now()
+      try {
+        audioResponse = await axiosClient({
+          ...this.axiosTtsEffectsParams,
+          data: ttsResponse.data,
+          headers: {
+            ...(this.axiosTtsEffectsParams.headers || {}),
+            'Content-Type': (ttsResponse.headers && ttsResponse.headers['content-type']) || 'audio/wav'
+          }
+        })
+      } catch (err) {
+        throw new Error(`TTS effects failed - ${this._getAxiosErrOutput(err)}`)
+      }
+      if (!audioResponse || !Buffer.isBuffer(audioResponse.data)) {
+        throw new Error(`TTS effects failed, response is: ${this._getAxiosShortenedOutput(audioResponse && audioResponse.data)}`)
+      }
+      debug(`TTS effects response ${Date.now() - effectsStart} ms (chars: ${textLen})`)
+    }
+    const durationHeader = audioResponse.headers && audioResponse.headers['content-duration']
     return {
-      buffer: ttsResponse.data,
-      duration: durationHeader
+      buffer: audioResponse.data,
+      duration: durationHeader || (ttsResponse.headers && ttsResponse.headers['content-duration']),
+      contentType: (audioResponse.headers && audioResponse.headers['content-type']) || 'audio/wav'
     }
   }
 
@@ -2329,7 +2382,7 @@ class BotiumConnectorVoip {
         if (cached.state === 'ready') {
           this._touchTtsCache(cacheKey, cached)
           debug(`TTS cache hit (chars: ${_.isString(text) ? text.length : 0})`)
-          return { buffer: cached.buffer, duration: cached.duration }
+          return { buffer: cached.buffer, duration: cached.duration, contentType: cached.contentType }
         }
         if (cached.state === 'pending') {
           return cached.promise
@@ -2340,7 +2393,7 @@ class BotiumConnectorVoip {
     const fetchPromise = this._fetchTts(ttsRequest, text)
       .then(result => {
         if (this._isTtsCacheEnabled()) {
-          this._setTtsCacheEntry(cacheKey, { state: 'ready', buffer: result.buffer, duration: result.duration })
+          this._setTtsCacheEntry(cacheKey, { state: 'ready', buffer: result.buffer, duration: result.duration, contentType: result.contentType })
         }
         return result
       })
