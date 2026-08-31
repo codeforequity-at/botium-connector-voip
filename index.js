@@ -28,8 +28,9 @@ module.exports = {
       },
       {
         name: 'VOIP_TTS_EFFECTS_PROFILE',
-        label: 'Voice Effect Profile',
+        label: 'Voice Effect Profiles',
         type: 'speechnoiseprofile',
+        multiple: true,
         required: false
       },
       {

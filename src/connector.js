@@ -1484,10 +1484,8 @@ class BotiumConnectorVoip {
       setTimeout(async () => {
         try {
           let duration = 0
-          const preferVoiceCapRaw = this.caps[Capabilities.VOIP_USER_INPUT_PREFER_VOICE]
-          const preferVoice = !!preferVoiceCapRaw
-          const skipTtsForMixedInput = preferVoice && hasText && hasVoiceMedia
-          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} preferVoice=${preferVoice} preferVoiceRaw=${JSON.stringify(preferVoiceCapRaw)} skipTtsForMixedInput=${skipTtsForMixedInput}`)
+          const skipTtsForMixedInput = hasVoiceMedia
+          debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
           // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
           // the coach can place the agent turn on the recording timeline.
@@ -1627,7 +1625,7 @@ class BotiumConnectorVoip {
                 }
               }
             } else {
-              debug('UserSays routing: skipping TTS for mixed input because VOIP_USER_INPUT_PREFER_VOICE is enabled')
+              debug('UserSays routing: skipping TTS because provided audio takes precedence')
             }
           }
           if (msg && msg.media && msg.media.length > 0 && msg.media[0].buffer) {
