@@ -29,6 +29,8 @@ class NamoTurnHandler {
       },
       getLastVadSpeechEndAt: () => this._lastVadSpeechEndAt,
       setLastVadSpeechEndAt: (v) => { this._lastVadSpeechEndAt = v },
+      getSpeechEndAtMs: () => (ctx.getSpeechEndAtMs ? ctx.getSpeechEndAtMs() : null),
+      getReplyConnectorDeadlineAtMs: () => (ctx.getReplyConnectorDeadlineAtMs ? ctx.getReplyConnectorDeadlineAtMs() : null),
       eventEmitter: ctx.eventEmitter,
       sessionId: ctx.sessionId,
       _info: (event, data) => ctx._info(event, { sessionId: ctx.sessionId, ...data }),
