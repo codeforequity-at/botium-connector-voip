@@ -11,7 +11,10 @@ const TEN_VAD_DOWNLOAD_URL =
 const TEN_VAD_UPSTREAM_REPO = 'https://github.com/TEN-framework/ten-vad'
 const TEN_VAD_SHERPA_REPO = 'https://github.com/k2-fsa/sherpa-onnx'
 const ONNX_FILENAME = 'ten-vad.int8.onnx'
-const { bundledModelPath: packageBundledModelPath } = require('../package-assets')
+const { bundledModelPath: packageBundledModelPath, assetsModelsDir } = require('../package-assets')
+
+const TEN_VAD_METADATA_HINT =
+  'Expected sherpa asr-models ten-vad.int8.onnx with ONNX metadata; see assets/models/TEN-VAD.md'
 
 let downloadPromise = null
 
@@ -49,25 +52,51 @@ const configuredOverridePath = (caps, Capabilities) => {
   return null
 }
 
-/**
- * Read ONNX StringStringEntryProto metadata without extra dependencies.
- */
-const readOnnxMetadataString = (buf, key) => {
-  const keyIdx = buf.indexOf(Buffer.from(key, 'utf8'))
-  if (keyIdx < 0) throw new Error(`ONNX metadata key missing: ${key}`)
-  let i = keyIdx + key.length
-  if (buf[i] !== 0x12) throw new Error(`ONNX metadata field framing invalid for: ${key}`)
-  i += 1
+/** Sherpa asr-models TEN VAD uses a 3-byte length prefix 0xc2 after the value tag for long CSV metadata. */
+const readOnnxMetadataValueLength = (buf, i) => {
+  if (buf[i] === 0xc2 && i + 2 < buf.length) {
+    const len = (buf[i + 1] & 0x7f) + (buf[i + 2] << 7)
+    return { len, next: i + 3 }
+  }
   let len = 0
   let shift = 0
+  let j = i
   for (;;) {
-    const b = buf[i]
-    i += 1
+    const b = buf[j]
+    j += 1
     len |= (b & 0x7f) << shift
     if ((b & 0x80) === 0) break
     shift += 7
   }
-  return buf.slice(i, i + len).toString('utf8')
+  return { len, next: j }
+}
+
+const findMetadataKeyEntry = (buf, key) => {
+  const keyBuf = Buffer.from(key, 'utf8')
+  if (keyBuf.length > 127) throw new Error(`ONNX metadata key too long: ${key}`)
+  const pattern = Buffer.concat([Buffer.from([0x0a, keyBuf.length]), keyBuf, Buffer.from([0x12])])
+  let idx = -1
+  let pos = 0
+  while (pos < buf.length) {
+    const hit = buf.indexOf(pattern, pos)
+    if (hit < 0) break
+    idx = hit
+    pos = hit + 1
+  }
+  if (idx < 0) throw new Error(`ONNX metadata key missing: ${key}`)
+  return idx + pattern.length
+}
+
+/**
+ * Read ONNX StringStringEntryProto metadata without extra dependencies.
+ */
+const readOnnxMetadataString = (buf, key) => {
+  const valueTagPos = findMetadataKeyEntry(buf, key)
+  const { len, next } = readOnnxMetadataValueLength(buf, valueTagPos)
+  if (len <= 0 || next + len > buf.length) {
+    throw new Error(`ONNX metadata value length invalid for: ${key}`)
+  }
+  return buf.slice(next, next + len).toString('utf8')
 }
 
 const parseTenVadMetadata = (modelPath) => {
@@ -83,6 +112,14 @@ const parseTenVadMetadata = (modelPath) => {
     throw new Error('ten-vad metadata vector sizes invalid')
   }
   return { mean, invStddev, window }
+}
+
+const assertValidTenVadModelFile = (modelPath) => {
+  try {
+    return parseTenVadMetadata(modelPath)
+  } catch (err) {
+    throw new Error(`${err.message} — ${TEN_VAD_METADATA_HINT} (path: ${modelPath})`)
+  }
 }
 
 const downloadOnnx = async ({ destPath, log }) => {
@@ -121,17 +158,40 @@ const resolveTenVadModelPath = async ({ caps, Capabilities, log = () => {} }) =>
     if (!fs.existsSync(override)) {
       throw new Error(`TEN VAD model not found at configured path: ${override}`)
     }
+    assertValidTenVadModelFile(override)
     return override
   }
   const bundled = bundledModelPath()
-  if (fs.existsSync(bundled)) return bundled
+  if (fs.existsSync(bundled)) {
+    assertValidTenVadModelFile(bundled)
+    return bundled
+  }
+
+  log('ten_vad_bundled_missing', {
+    bundledPath: bundled,
+    assetsModelsDir: assetsModelsDir(),
+    hint: TEN_VAD_METADATA_HINT
+  })
 
   const destPath = defaultCachePath()
-  if (fs.existsSync(destPath)) return destPath
+  if (fs.existsSync(destPath)) {
+    try {
+      assertValidTenVadModelFile(destPath)
+      return destPath
+    } catch (err) {
+      log('ten_vad_cache_invalid', { path: destPath, error: err.message })
+      await fs.promises.rm(destPath, { force: true })
+    }
+  }
   if (!downloadPromise) {
-    downloadPromise = downloadOnnx({ destPath, log }).finally(() => {
-      downloadPromise = null
-    })
+    downloadPromise = downloadOnnx({ destPath, log })
+      .then((downloadedPath) => {
+        assertValidTenVadModelFile(downloadedPath)
+        return downloadedPath
+      })
+      .finally(() => {
+        downloadPromise = null
+      })
   }
   return downloadPromise
 }
@@ -149,5 +209,7 @@ module.exports = {
   configuredOverridePath,
   readOnnxMetadataString,
   parseTenVadMetadata,
+  assertValidTenVadModelFile,
+  TEN_VAD_METADATA_HINT,
   resolveTenVadModelPath
 }
