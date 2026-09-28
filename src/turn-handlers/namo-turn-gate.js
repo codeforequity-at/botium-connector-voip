@@ -1,9 +1,11 @@
+const { computeMaxWaitRemainingMs } = require('../reply-budget')
 const DIGIT_ONLY_RE = /^[\d\s.,#-]+$/
 const TURN_BUFFERING = 'buffering'
 const TURN_SOFT_ENDED = 'soft_ended'
 const DEFAULT_MEDIAN_GAP_MS = 400
 const MAX_GAP_SAMPLES = 12
 const HANDLING_NAMO = 'NAMO'
+const QUESTION_FRAGMENT_DENY_RE = /^how can i\??$/i
 
 const numberCapability = (caps, name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) => {
   const parsed = Number(caps[name])
@@ -38,6 +40,8 @@ class NamoTurnGate {
     getVadEnabled,
     getLastVadSpeechEndAt,
     setLastVadSpeechEndAt,
+    getSpeechEndAtMs,
+    getReplyConnectorDeadlineAtMs,
     eventEmitter,
     sessionId,
     _info,
@@ -52,6 +56,8 @@ class NamoTurnGate {
     this._getVadEnabled = getVadEnabled
     this._getLastVadSpeechEndAt = getLastVadSpeechEndAt
     this._setLastVadSpeechEndAt = setLastVadSpeechEndAt
+    this._getSpeechEndAtMs = getSpeechEndAtMs || (() => null)
+    this._getReplyConnectorDeadlineAtMs = getReplyConnectorDeadlineAtMs || (() => null)
     this.eventEmitter = eventEmitter
     this.sessionId = sessionId
     this._info = _info
@@ -64,6 +70,14 @@ class NamoTurnGate {
     this.emitStableMs = numberCapability(caps, Capabilities.VOIP_NAMO_EMIT_STABLE_MS, 600, { min: 0 })
     this.gapOutlierFactor = numberCapability(caps, Capabilities.VOIP_NAMO_GAP_OUTLIER_FACTOR, 2.5, { min: 1 })
     this.reopenMs = numberCapability(caps, Capabilities.VOIP_NAMO_REOPEN_MS, 800, { min: 0 })
+    this.reopenFastMs = numberCapability(caps, Capabilities.VOIP_NAMO_REOPEN_FAST_MS, 250, { min: 0 })
+    this.reopenFastEou = numberCapability(caps, Capabilities.VOIP_NAMO_REOPEN_FAST_EOU, 0.99, { min: 0, max: 1 })
+    this.questionMinChars = numberCapability(caps, Capabilities.VOIP_NAMO_QUESTION_MIN_CHARS, 28, { min: 0 })
+    this.minSegmentChars = numberCapability(caps, Capabilities.VOIP_NAMO_MIN_SEGMENT_CHARS, 12, { min: 0 })
+    this.maxWaitVadExtensionMs = numberCapability(caps, Capabilities.VOIP_NAMO_MAX_WAIT_VAD_EXTENSION_MS, 1500, { min: 0 })
+    this.joinedQuestionFlushEnable = booleanCapability(caps, Capabilities.VOIP_NAMO_JOINED_QUESTION_FLUSH_ENABLE, true)
+    this.joinedQuestionMinConfidence = numberCapability(caps, Capabilities.VOIP_NAMO_JOINED_QUESTION_FLUSH_MIN_CONFIDENCE, 0.85, { min: 0, max: 1 })
+    this.joinedQuestionMaxChunks = numberCapability(caps, Capabilities.VOIP_NAMO_JOINED_QUESTION_MAX_CHUNKS, 2, { min: 2, max: 8 })
     this.dtmfEchoMs = numberCapability(caps, Capabilities.VOIP_NAMO_DTMF_ECHO_MS, 600, { min: 0 })
     this.shortSegmentMergeMs = numberCapability(caps, Capabilities.VOIP_NAMO_VAD_SHORT_SEGMENT_MERGE_MS, 250, { min: 0 })
     this.delimiter = caps[Capabilities.VOIP_STT_MESSAGE_HANDLING_DELIMITER] || '. '
@@ -88,9 +102,64 @@ class NamoTurnGate {
     this.pendingVadFlush = false
     this.pendingVadResult = null
     this.pendingVadReason = null
+    this.emitStableSatisfiedAt = null
+    this.lastDecisionComplete = false
+    this.lastEouProbability = null
+    this.maxWaitExtended = false
   }
 
   get _messages () { return this._getMessages() || [] }
+
+  _shouldDeferMaxWaitClock () {
+    if (this.pendingStartedAt != null) return false
+    if (this._messages.length !== 1) return false
+    const last = this._lastSegmentText()
+    if (!last || last.length >= this.minSegmentChars) return false
+    if (/\?\s*$/.test(last)) return false
+    return true
+  }
+
+  _maxWaitAnchorMs () {
+    const speechEndAt = this._getSpeechEndAtMs()
+    return Number.isFinite(speechEndAt) ? speechEndAt : Date.now()
+  }
+
+  _reanchorMaxWaitClock (reason) {
+    if (this.pendingStartedAt == null || !this._messages.length) return
+    const speechEndAt = this._getSpeechEndAtMs()
+    if (!Number.isFinite(speechEndAt) || speechEndAt <= this.pendingStartedAt) return
+    this.pendingStartedAt = speechEndAt
+    this._info('namo_max_wait_reanchor', {
+      sessionId: this.sessionId,
+      reason,
+      speechEndAtMs: speechEndAt,
+      bufferedChunks: this._messages.length
+    })
+    this._armMaxWaitTimer(reason)
+  }
+
+  _startMaxWaitClockIfNeeded (reason) {
+    if (this.pendingStartedAt != null) return
+    if (!this._messages.length) return
+    this.pendingStartedAt = this._maxWaitAnchorMs()
+    this.maxWaitExtended = false
+    this._armMaxWaitTimer(reason)
+  }
+
+  _resolveReopenDelay (result) {
+    const eou = result && result.eouProbability
+    if (Number.isFinite(eou) && eou >= this.reopenFastEou && !this._shouldHoldForVad()) {
+      return Math.min(this.reopenMs, this.reopenFastMs)
+    }
+    return this.reopenMs
+  }
+
+  _shouldSkipReopenAfterEmitStable (result) {
+    if (!this.emitStableSatisfiedAt || this.emitStableMs <= 0) return false
+    if (this._messages.length !== 1 || this._shouldHoldForVad()) return false
+    const eou = result && result.eouProbability
+    return Number.isFinite(eou) && eou >= this.threshold
+  }
 
   noteAgentDtmf () {
     this.lastAgentDtmfAt = Date.now()
@@ -119,7 +188,7 @@ class NamoTurnGate {
     }
     this._clearQuestionFlushTimer()
     this._clearReopenTimer()
-    if (this.pendingStartedAt != null) this._armMaxWaitTimer()
+    this._startMaxWaitClockIfNeeded('vad_speech_start')
   }
 
   onVadSpeechEnd () {
@@ -150,6 +219,7 @@ class NamoTurnGate {
       return
     }
     if (this._messages.length) {
+      this._startMaxWaitClockIfNeeded('vad_speech_end')
       this._armEmitStableTimer()
       this.decisionChain = this.decisionChain
         .then(() => this._scheduleDecision())
@@ -169,10 +239,17 @@ class NamoTurnGate {
     this._maybeSplitOnOutlierGap(gapMs)
     this._openTurnIfNeeded()
     this.candidateVersion++
-    if (this.pendingStartedAt == null) {
-      this.pendingStartedAt = Date.now()
-      this._armMaxWaitTimer()
+    if (this._shouldDeferMaxWaitClock()) {
+      this._info('namo_max_wait_deferred', {
+        sessionId: this.sessionId,
+        bufferedChunks: this._messages.length,
+        preview: this._lastSegmentText().substring(0, 80),
+        minSegmentChars: this.minSegmentChars
+      })
+    } else {
+      this._startMaxWaitClockIfNeeded('stt_final')
     }
+    this._reanchorMaxWaitClock('stt_final')
     const text = this._joinedText()
     this._info('namo_candidate_received', {
       sessionId: this.sessionId,
@@ -188,7 +265,15 @@ class NamoTurnGate {
     this._clearEmitStableTimer()
     this._scheduleDecision()
     this._armQuestionFlushTimer()
-    this._armEmitStableTimer()
+    const joinedText = this._joinedText()
+    const lastSegmentText = this._lastSegmentText()
+    if (this._shouldFlushJoinedQuestionStt(joinedText, lastSegmentText)) {
+      this.decisionChain = this.decisionChain
+        .then(() => this._tryCohesionEmit(Date.now()))
+        .catch(err => this._handleInferenceError(err))
+    } else {
+      this._armEmitStableTimer()
+    }
   }
 
   forceFlush (reason) {
@@ -209,6 +294,11 @@ class NamoTurnGate {
     this.pendingVadFlush = false
     this.pendingVadResult = null
     this.pendingVadReason = null
+    this.emitStableSatisfiedAt = null
+    this.lastDecisionComplete = false
+    this.lastEouProbability = null
+    this.maxWaitExtended = false
+    this.pendingStartedAt = null
   }
 
   get timersActive () {
@@ -229,6 +319,7 @@ class NamoTurnGate {
     this._clearReopenTimer()
     this._clearEmitStableTimer()
     this._clearQuestionFlushTimer()
+    this.emitStableSatisfiedAt = null
     this._info('namo_turn_reopen', {
       reason,
       turnId: this.turnId,
@@ -286,6 +377,10 @@ class NamoTurnGate {
       return
     }
     if (this._vadGateActive()) {
+      if (this._shouldSkipReopenAfterEmitStable(result)) {
+        this._flushPending(reason === 'model_complete' ? 'model_complete' : reason, result)
+        return
+      }
       this._softEndTurn(reason === 'model_complete' ? 'model_complete' : reason, result)
       return
     }
@@ -331,7 +426,8 @@ class NamoTurnGate {
   _armReopenTimer () {
     this._clearReopenTimer()
     if (!this._messages.length) return
-    const delay = this.reopenMs
+    const result = this.pendingVadResult
+    const delay = this._resolveReopenDelay(result)
     const armedAt = Date.now()
     const finish = () => {
       this.reopenTimer = null
@@ -342,6 +438,7 @@ class NamoTurnGate {
       }
       this._info('namo_reopen_commit', {
         reopenMs: this.reopenMs,
+        reopenMsUsed: delay,
         actualWaitMs: Date.now() - armedAt,
         turnId: this.turnId,
         revision: this.revision,
@@ -380,6 +477,7 @@ class NamoTurnGate {
     this.emitStableTimer = setTimeout(() => {
       if (version !== this.emitStableVersion) return
       this.emitStableTimer = null
+      this.emitStableSatisfiedAt = Date.now()
       this.decisionChain = this.decisionChain
         .then(() => this._tryCohesionEmit(armedAt))
         .catch(err => this._handleInferenceError(err))
@@ -457,6 +555,30 @@ class NamoTurnGate {
     return last && typeof last.messageText === 'string' ? last.messageText.trim() : ''
   }
 
+  _lastSegmentSttConfidence () {
+    const last = this._messages[this._messages.length - 1]
+    if (!last || last.sourceData == null) return null
+    const sd = last.sourceData
+    const raw = sd.sttConfidence ?? sd.confidence
+    const parsed = Number(raw)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+
+  _shouldFlushJoinedQuestionStt (joinedText, lastSegmentText) {
+    if (!this.joinedQuestionFlushEnable) return false
+    const chunks = this._messages.length
+    if (chunks < 2 || chunks > this.joinedQuestionMaxChunks) return false
+    if (this._shouldHoldForVad()) return false
+    const last = String(lastSegmentText || '').trim()
+    if (!last || QUESTION_FRAGMENT_DENY_RE.test(last)) return false
+    if (!/\?\s*$/.test(last)) return false
+    const conf = this._lastSegmentSttConfidence()
+    if (conf == null || conf < this.joinedQuestionMinConfidence) return false
+    const joined = String(joinedText || '').trim()
+    if (!joined.includes(last)) return false
+    return true
+  }
+
   _looksLikeQuestionSegment (text) {
     const trimmed = String(text || '').trim()
     if (!trimmed) return false
@@ -471,8 +593,12 @@ class NamoTurnGate {
   _looksLikeQuestionCandidate (joinedText, lastSegmentText) {
     const joined = String(joinedText || '').trim()
     const last = String(lastSegmentText || '').trim()
+    if (QUESTION_FRAGMENT_DENY_RE.test(last)) return false
     if (/\?\s*$/.test(joined)) return true
-    return this._looksLikeQuestionSegment(last)
+    if (last.length >= this.questionMinChars) {
+      return this._looksLikeQuestionSegment(last)
+    }
+    return false
   }
 
   async _tryCohesionEmit (armedAt = Date.now()) {
@@ -536,8 +662,22 @@ class NamoTurnGate {
       return false
     }
 
+    if (!joinedComplete && this._shouldFlushJoinedQuestionStt(joinedText, lastText)) {
+      this._info('namo_joined_question_stt_flush', {
+        bufferedChunks: this._messages.length,
+        sttConfidence: this._lastSegmentSttConfidence(),
+        preview: joinedText.substring(0, 160)
+      })
+      this._flushPending('model_complete', joinedResult)
+      return true
+    }
+
     if (joinedComplete || forceQuestionFlush) {
       const reason = forceQuestionFlush ? 'question_heuristic' : 'model_complete'
+      if (this._shouldSkipReopenAfterEmitStable(joinedResult)) {
+        this._flushPending(reason, joinedResult)
+        return true
+      }
       this._requestSemanticFlush(reason, joinedResult)
       return true
     }
@@ -550,20 +690,70 @@ class NamoTurnGate {
     return false
   }
 
-  _armMaxWaitTimer () {
+  _armMaxWaitTimer (armReason) {
     this._clearMaxWaitTimer()
-    const elapsed = this.pendingStartedAt == null ? 0 : Date.now() - this.pendingStartedAt
-    const remainingMs = Math.max(0, this.maxWaitMs - elapsed)
-    const armedAt = Date.now()
-    this.maxWaitTimer = setTimeout(() => {
-      this._info('namo_max_wait_fired', {
+    const now = Date.now()
+    const deadlineAtMs = this._getReplyConnectorDeadlineAtMs()
+    const { remainingMs, cappedByDeadline } = computeMaxWaitRemainingMs({
+      anchorMs: this.pendingStartedAt,
+      maxWaitMs: this.maxWaitMs,
+      maxWaitExtended: this.maxWaitExtended,
+      vadExtensionMs: this.maxWaitVadExtensionMs,
+      deadlineAtMs,
+      now
+    })
+    if (cappedByDeadline) {
+      this._info('namo_max_wait_deadline_cap', {
+        sessionId: this.sessionId,
+        remainingMs,
+        deadlineAtMs,
+        bufferedChunks: this._messages.length
+      })
+    }
+    const armedAt = now
+    const finishMaxWait = () => {
+      this._info('namo_max_wait_forced', {
+        sessionId: this.sessionId,
         maxWaitMs: this.maxWaitMs,
         remainingMs,
         actualWaitMs: Date.now() - armedAt,
         bufferedChunks: this._messages.length,
-        action: 'flush'
+        vadSpeechActive: this._getVadSpeechActive(),
+        lastDecisionComplete: this.lastDecisionComplete,
+        lastEouProbability: this.lastEouProbability,
+        preview: this._joinedText().substring(0, 160),
+        action: 'flush',
+        ...(cappedByDeadline ? { cappedByDeadline: true } : {})
       })
       this._flushPending('max_wait')
+    }
+    if (remainingMs <= 0) {
+      finishMaxWait()
+      return
+    }
+    this.maxWaitTimer = setTimeout(() => {
+      const replyDeadline = this._getReplyConnectorDeadlineAtMs()
+      if (Number.isFinite(replyDeadline) && Date.now() >= replyDeadline) {
+        finishMaxWait()
+        return
+      }
+      const shouldExtend = !this.maxWaitExtended &&
+        this.maxWaitVadExtensionMs > 0 &&
+        this._shouldHoldForVad() &&
+        !(Number.isFinite(replyDeadline) && Date.now() >= replyDeadline)
+      if (shouldExtend) {
+        this.maxWaitExtended = true
+        this._info('namo_max_wait_extended', {
+          sessionId: this.sessionId,
+          extensionMs: this.maxWaitVadExtensionMs,
+          vadSpeechActive: this._getVadSpeechActive(),
+          lastDecisionComplete: this.lastDecisionComplete,
+          bufferedChunks: this._messages.length
+        })
+        this._armMaxWaitTimer(armReason)
+        return
+      }
+      finishMaxWait()
     }, remainingMs)
 
     this._info('namo_max_wait_armed', {
@@ -617,6 +807,8 @@ class NamoTurnGate {
     }
 
     const complete = result.eouProbability >= this.threshold
+    this.lastDecisionComplete = complete
+    this.lastEouProbability = result.eouProbability
     const bufferedMs = this.pendingStartedAt == null ? 0 : Date.now() - this.pendingStartedAt
     const lastText = this._lastSegmentText()
     const looksLikeCompleteQuestion = this._looksLikeQuestionCandidate(text, lastText)
@@ -625,7 +817,7 @@ class NamoTurnGate {
       this.questionFlushMs > 0 &&
       bufferedMs >= this.questionFlushMs
     const decision = (complete || forceQuestionFlush) ? 'complete' : 'incomplete'
-    const vadSpeechActive = this.vadProcessor ? this.vadProcessor.speechActive : false
+    const vadSpeechActive = this._getVadSpeechActive()
     this._info('namo_decision', {
       candidateVersion: version,
       decision,
@@ -739,6 +931,10 @@ _vadGateMetadata () {
       } catch (_) {}
     }
     this.pendingStartedAt = null
+    this.emitStableSatisfiedAt = null
+    this.maxWaitExtended = false
+    this.lastDecisionComplete = false
+    this.lastEouProbability = null
     this.candidateVersion++
     this.lastCommittedAt = Date.now()
     this._setLastVadSpeechEndAt(null)
