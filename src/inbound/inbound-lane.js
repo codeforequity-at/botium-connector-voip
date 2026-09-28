@@ -51,7 +51,12 @@ class InboundLane {
       })
       .catch((err) => {
         this._loadError = err
-        throw err
+        this._info('ten_vad_load_failed', {
+          sessionId: this._sessionId,
+          modelPath: this._modelPath,
+          error: err && err.message
+        })
+        return null
       })
   }
 
