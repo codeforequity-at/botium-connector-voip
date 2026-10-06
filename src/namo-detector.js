@@ -4,6 +4,8 @@ const path = require('path')
 const { Readable } = require('stream')
 const { pipeline } = require('stream/promises')
 
+const { trackSession } = require('./onnx-lifecycle')
+
 const DEFAULT_MODEL_ID = 'videosdk-live/Namo-Turn-Detector-v1-English'
 const DEFAULT_MODEL_REVISION = '4dcc9713be5071ef43e510f72b1eefcb2f99cb04'
 const MODEL_FILENAME = 'model_quant.onnx'
@@ -99,7 +101,7 @@ const loadModel = async (options) => {
     ort.InferenceSession.create(modelPath, {
       executionProviders: ['cpu'],
       graphOptimizationLevel: 'all'
-    })
+    }).then(session => trackSession(session))
   ])
 
   log('namo_model_ready', {

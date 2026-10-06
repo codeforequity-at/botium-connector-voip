@@ -1,4 +1,5 @@
 const ort = require('onnxruntime-node')
+const { trackSession } = require('../onnx-lifecycle')
 const { parseTenVadMetadata } = require('./ten-vad-model')
 const { buildTenVadMelBanks, applyMelBanks } = require('./ten-vad-mel')
 const { rfftKaldi1024 } = require('./ten-vad-rfft')
@@ -79,9 +80,9 @@ class TenVadEngine {
     this._invStddev = meta.invStddev
     this._window = meta.window
 
-    this._session = await ort.InferenceSession.create(this.modelPath, {
+    this._session = trackSession(await ort.InferenceSession.create(this.modelPath, {
       executionProviders: ['cpu']
-    })
+    }))
     this._inputNames = this._session.inputNames
     this._outputNames = this._session.outputNames
     this.reset()

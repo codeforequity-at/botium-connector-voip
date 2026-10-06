@@ -92,7 +92,7 @@ module.exports = {
       {
         name: 'VOIP_NAMO_EOU_THRESHOLD',
         label: 'Namo end-of-utterance confidence threshold',
-        type: 'number',
+        type: 'string',
         required: false,
         advanced: true
       },
