@@ -28,7 +28,7 @@ node scripts/prefetch-namo-model.cjs
 - `VOIP_NAMO_EOU_THRESHOLD` (default `0.85`)
 - `VOIP_NAMO_REOPEN_MS` (default `800`)
 - `VOIP_NAMO_MAX_WAIT_MS`, `VOIP_NAMO_EMIT_STABLE_MS`, `VOIP_NAMO_DTMF_ECHO_MS`
-- `VOIP_STT_MESSAGE_HANDLING` — use `EOU` (recommended), `PSST`, or `JOIN` to buffer finals; see [TURN-DETECTION.md](./TURN-DETECTION.md) (not `ORIGINAL` for coach/OTS flows). Saved `NAMO` is accepted as `EOU`.
+- `VOIP_STT_MESSAGE_HANDLING` — use `EOU` (recommended), `PSST`, or `JOIN` to buffer finals; see [TURN-DETECTION.md](./TURN-DETECTION.md) (not `ORIGINAL` for coach/OTS flows)
 - `VOIP_OTS_LATENCY_PROFILE` — objective-test latency presets (see `applyOtsLatencyProfile` in `src/reply-budget.js`)
 
 ### Reply budget (OTS)

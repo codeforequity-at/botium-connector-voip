@@ -4,8 +4,8 @@
 
 | Value | STT finals | Turn commit |
 |-------|------------|-------------|
-| **EOU** (recommended) | Buffered in `botMsgs` | End-of-utterance gate + TEN VAD only (`commitNamoFlush`); no VoIP worker `setSttSilenceDuration`. Saved `NAMO` is the same method. |
-| **PSST** / **JOIN** / **CONCAT** | Buffered | With `VOIP_STT_TURN_HANDLER=EOU`, legacy **PSST+EOU** (and saved **PSST+NAMO**) is normalized to **EOU** on connector validate |
+| **EOU** (recommended) | Buffered in `botMsgs` | End-of-utterance gate + TEN VAD only (`commitNamoFlush`); no VoIP worker `setSttSilenceDuration` |
+| **PSST** / **JOIN** / **CONCAT** | Buffered | With `VOIP_STT_TURN_HANDLER=EOU`, **PSST** handling is normalized to **EOU** on connector validate |
 | **ORIGINAL** | Immediate emit | End-of-utterance gate not used |
 | **SPLIT** | Immediate per sentence | End-of-utterance gate not used |
 
@@ -75,7 +75,7 @@ If Namo model init or inference fails, the connector disables Namo and uses the 
 
 ## Manual verification (OTS logs)
 
-1. Set handling **EOU** (or rely on OTS defaults / legacy PSST+EOU shim). A saved **NAMO** value is treated as EOU.
+1. Set handling **EOU** (or rely on OTS defaults).
 2. Expect per bot turn: `stt_final` → `namo_candidate_received` / `namo_decision` → `namo_flush`.
 3. No VoIP worker `setSttSilenceDuration` while handling is EOU; `voip.psstTimerArmed` from the gate should include `strategy: EOU`.
 4. **ORIGINAL** chatbots should still emit on each final without `namo_decision`.

@@ -1,11 +1,6 @@
 const HANDLING_EOU = 'EOU'
-const HANDLING_EOU_LEGACY = 'NAMO'
 
-const normalizeHandling = (h) => {
-  const value = String(h || '').trim().toUpperCase()
-  if (value === HANDLING_EOU_LEGACY) return HANDLING_EOU
-  return value
-}
+const normalizeHandling = (h) => String(h || '').trim().toUpperCase()
 
 const isEouHandling = (handling) => normalizeHandling(handling) === HANDLING_EOU
 
@@ -16,7 +11,6 @@ const isBufferedSttHandling = (handling) => {
 
 module.exports = {
   HANDLING_EOU,
-  HANDLING_EOU_LEGACY,
   isEouHandling,
   isBufferedSttHandling,
   normalizeHandling

@@ -323,17 +323,9 @@ class BotiumConnectorVoip {
     const userCaps = this.caps || {}
     this.caps = Object.assign({}, Defaults, userCaps)
     applyOtsLatencyProfile(this.caps, userCaps, Capabilities, Defaults)
-    const rawTurnHandler = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || HANDLING_EOU).toUpperCase()
-    const eouTurnHandler = rawTurnHandler === HANDLING_EOU || rawTurnHandler === 'NAMO'
-    if (rawTurnHandler === 'NAMO' || rawTurnHandler === 'SMART_TURN') {
-      this.caps[Capabilities.VOIP_STT_TURN_HANDLER] = HANDLING_EOU
-    }
-    let handlingKey = String(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] || '').toUpperCase()
-    if (handlingKey === 'NAMO') {
-      this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] = HANDLING_EOU
-      handlingKey = HANDLING_EOU
-    }
-    if (eouTurnHandler && handlingKey === 'PSST') {
+    const turnHandlerKey = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || HANDLING_EOU).toUpperCase()
+    const handlingKey = String(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] || '').toUpperCase()
+    if (turnHandlerKey === HANDLING_EOU && handlingKey === 'PSST') {
       _info('voip_handling_legacy_composite', {
         sessionId: this.sessionId || null,
         from: 'PSST',
