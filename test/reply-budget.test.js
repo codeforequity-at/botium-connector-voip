@@ -82,7 +82,7 @@ test('applyOtsLatencyProfile sets unset latency caps', () => {
   assert.equal(merged[Capabilities.VOIP_NAMO_MAX_WAIT_VAD_EXTENSION_MS], 0)
   assert.equal(merged[Capabilities.VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS], 400)
   assert.equal(merged[Capabilities.VOIP_NAMO_JOINED_QUESTION_FLUSH_ENABLE], true)
-  assert.equal(merged[Capabilities.VOIP_STT_MESSAGE_HANDLING], 'NAMO')
+  assert.equal(merged[Capabilities.VOIP_STT_MESSAGE_HANDLING], 'EOU')
 })
 
 test('applyOtsLatencyProfile keeps user overrides', () => {

@@ -22,8 +22,8 @@ const {
   applyOtsLatencyProfile
 } = require('./reply-budget')
 const {
-  HANDLING_NAMO,
-  isNamoHandling,
+  HANDLING_EOU,
+  isEouHandling,
   isBufferedSttHandling
 } = require('./stt-message-handling')
 // Logging policy: info = rare, business-relevant lifecycle events (always visible).
@@ -223,7 +223,7 @@ const Defaults = {
   VOIP_TURN_AUDIO_ENABLE: true,
   VOIP_TURN_AUDIO_PADDING_MS: 150,
   VOIP_TURN_AUDIO_OFFSET_MS: 0,
-  VOIP_STT_TURN_HANDLER: 'NAMO',
+  VOIP_STT_TURN_HANDLER: 'EOU',
   VOIP_TEN_VAD_THRESHOLD: 0.5,
   VOIP_TEN_VAD_MIN_SILENCE_MS: 280,
   VOIP_NAMO_EOU_THRESHOLD: 0.85,
@@ -323,15 +323,23 @@ class BotiumConnectorVoip {
     const userCaps = this.caps || {}
     this.caps = Object.assign({}, Defaults, userCaps)
     applyOtsLatencyProfile(this.caps, userCaps, Capabilities, Defaults)
-    const turnHandlerKey = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || 'NAMO').toUpperCase()
-    const handlingKey = String(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] || '').toUpperCase()
-    if (turnHandlerKey === 'NAMO' && handlingKey === 'PSST') {
+    const rawTurnHandler = String(this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || HANDLING_EOU).toUpperCase()
+    const eouTurnHandler = rawTurnHandler === HANDLING_EOU || rawTurnHandler === 'NAMO'
+    if (rawTurnHandler === 'NAMO' || rawTurnHandler === 'SMART_TURN') {
+      this.caps[Capabilities.VOIP_STT_TURN_HANDLER] = HANDLING_EOU
+    }
+    let handlingKey = String(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] || '').toUpperCase()
+    if (handlingKey === 'NAMO') {
+      this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] = HANDLING_EOU
+      handlingKey = HANDLING_EOU
+    }
+    if (eouTurnHandler && handlingKey === 'PSST') {
       _info('voip_handling_legacy_composite', {
         sessionId: this.sessionId || null,
         from: 'PSST',
-        to: HANDLING_NAMO
+        to: HANDLING_EOU
       })
-      this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] = HANDLING_NAMO
+      this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] = HANDLING_EOU
     }
     debug(this.caps.VOIP_STT_MESSAGE_HANDLING)
 
@@ -1109,7 +1117,7 @@ class BotiumConnectorVoip {
             _info('callinfo_initialized', {
               sessionId: this.sessionId,
               sttHandling: this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING],
-              turnHandler: 'NAMO'
+              turnHandler: this.caps[Capabilities.VOIP_STT_TURN_HANDLER] || HANDLING_EOU
             })
             if (parseBoolean(this.caps[Capabilities.VOIP_WORKER_LOGS_ENABLE]) && parsedData.voipConfig.workerLogsEnabled !== true) {
               _info('worker_logs_unsupported', {
@@ -1356,7 +1364,7 @@ class BotiumConnectorVoip {
               } catch (err) { /* ignore */ }
             }
             const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-            if (isNamoHandling(sttHandling) && this.botMsgs && this.botMsgs.length > 0) {
+            if (isEouHandling(sttHandling) && this.botMsgs && this.botMsgs.length > 0) {
               connector.turnHandler.onSpeechResumed(true)
             } else {
               const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)

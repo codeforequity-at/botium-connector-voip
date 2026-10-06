@@ -87,7 +87,7 @@ function applyOtsLatencyProfile (mergedCaps, userCaps, Capabilities, Defaults) {
   setIfUnset(Capabilities.VOIP_NAMO_JOINED_QUESTION_FLUSH_ENABLE, true)
   setIfUnset(Capabilities.VOIP_STT_AZURE_SEGMENTATION_SILENCE_TIMEOUT_MS, 400)
   setIfUnset(Capabilities.VOIP_CED_ENABLE, false)
-  setIfUnset(Capabilities.VOIP_STT_MESSAGE_HANDLING, 'NAMO')
+  setIfUnset(Capabilities.VOIP_STT_MESSAGE_HANDLING, 'EOU')
   return mergedCaps
 }
 

@@ -4,12 +4,12 @@
 
 | Value | STT finals | Turn commit |
 |-------|------------|-------------|
-| **NAMO** (recommended) | Buffered in `botMsgs` | Namo gate + TEN VAD only (`commitNamoFlush`); no VoIP worker `setSttSilenceDuration` |
-| **PSST** / **JOIN** / **CONCAT** | Buffered | With `VOIP_STT_TURN_HANDLER=NAMO`, legacy **PSST+NAMO** is normalized to **NAMO** on connector validate |
-| **ORIGINAL** | Immediate emit | Namo gate not used |
-| **SPLIT** | Immediate per sentence | Namo gate not used |
+| **EOU** (recommended) | Buffered in `botMsgs` | End-of-utterance gate + TEN VAD only (`commitNamoFlush`); no VoIP worker `setSttSilenceDuration`. Saved `NAMO` is the same method. |
+| **PSST** / **JOIN** / **CONCAT** | Buffered | With `VOIP_STT_TURN_HANDLER=EOU`, legacy **PSST+EOU** (and saved **PSST+NAMO**) is normalized to **EOU** on connector validate |
+| **ORIGINAL** | Immediate emit | End-of-utterance gate not used |
+| **SPLIT** | Immediate per sentence | End-of-utterance gate not used |
 
-Objective tests with `VOIP_OTS_LATENCY_PROFILE` default handling to **NAMO** when unset (`applyOtsLatencyProfile`).
+Objective tests with `VOIP_OTS_LATENCY_PROFILE` default handling to **EOU** when unset (`applyOtsLatencyProfile`).
 
 ### OTS latency profile defaults (when unset on chatbot)
 
@@ -75,9 +75,9 @@ If Namo model init or inference fails, the connector disables Namo and uses the 
 
 ## Manual verification (OTS logs)
 
-1. Set handling **NAMO** (or rely on OTS defaults / legacy PSST+NAMO shim).
+1. Set handling **EOU** (or rely on OTS defaults / legacy PSST+EOU shim). A saved **NAMO** value is treated as EOU.
 2. Expect per bot turn: `stt_final` → `namo_candidate_received` / `namo_decision` → `namo_flush`.
-3. No VoIP worker `setSttSilenceDuration` while handling is NAMO; `voip.psstTimerArmed` from the gate should include `strategy: NAMO`.
+3. No VoIP worker `setSttSilenceDuration` while handling is EOU; `voip.psstTimerArmed` from the gate should include `strategy: EOU`.
 4. **ORIGINAL** chatbots should still emit on each final without `namo_decision`.
 5. Force Namo failure (invalid model path): `namo_model_error` then PSST fallback timers / flush.
 

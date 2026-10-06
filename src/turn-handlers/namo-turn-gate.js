@@ -4,7 +4,7 @@ const TURN_BUFFERING = 'buffering'
 const TURN_SOFT_ENDED = 'soft_ended'
 const DEFAULT_MEDIAN_GAP_MS = 400
 const MAX_GAP_SAMPLES = 12
-const HANDLING_NAMO = 'NAMO'
+const HANDLING_EOU = 'EOU'
 const QUESTION_FRAGMENT_DENY_RE = /^how can i\??$/i
 
 const numberCapability = (caps, name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) => {
@@ -776,7 +776,7 @@ class NamoTurnGate {
         remainingMs,
         bufferedChunks: this._messages.length,
         armedAt,
-        strategy: HANDLING_NAMO
+        strategy: HANDLING_EOU
       })
     }
   }
@@ -924,7 +924,7 @@ _vadGateMetadata () {
       try {
         this.eventEmitter.emit('ivr.turn.committed', {
           sessionId: this.sessionId,
-          turnHandler: 'NAMO',
+          turnHandler: HANDLING_EOU,
           reason,
           bufferedChunks: chunkCount
         })
@@ -952,4 +952,4 @@ _vadGateMetadata () {
   }
 }
 
-module.exports = { NamoTurnGate, TURN_BUFFERING, TURN_SOFT_ENDED, HANDLING_NAMO }
+module.exports = { NamoTurnGate, TURN_BUFFERING, TURN_SOFT_ENDED, HANDLING_EOU }
