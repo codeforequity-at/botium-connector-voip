@@ -3,6 +3,8 @@ const os = require('os')
 const path = require('path')
 const { Readable } = require('stream')
 const { pipeline } = require('stream/promises')
+const { AutoTokenizer, env } = require('@huggingface/transformers')
+const ort = require('onnxruntime-node')
 
 const { trackSession } = require('./onnx-lifecycle')
 
@@ -75,11 +77,6 @@ const loadModel = async (options) => {
     modelSource: configuredModelPath ? 'local' : 'huggingface',
     cacheDir
   })
-
-  const [{ AutoTokenizer, env }, ort] = await Promise.all([
-    import('@huggingface/transformers'),
-    Promise.resolve().then(() => require('onnxruntime-node'))
-  ])
 
   env.cacheDir = cacheDir
   const modelPath = configuredModelPath
