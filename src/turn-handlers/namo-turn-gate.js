@@ -858,7 +858,7 @@ class NamoTurnGate {
     }
   }
 
-_vadGateMetadata () {
+  _vadGateMetadata () {
     if (!this.vadEnabled) return {}
     return {
       vadEnabled: true,
@@ -885,10 +885,10 @@ _vadGateMetadata () {
         ...this._vadGateMetadata(),
         ...(result
           ? {
-              eouProbability: result.eouProbability,
-              incompleteProbability: result.incompleteProbability,
-              inferenceMs: result.inferenceMs
-            }
+            eouProbability: result.eouProbability,
+            incompleteProbability: result.incompleteProbability,
+            inferenceMs: result.inferenceMs
+          }
           : {})
       }
     }
