@@ -1,3 +1,8 @@
 module.exports = {
-    "extends": "standard"
-};
+  extends: 'standard',
+  globals: {
+    BigInt: 'readonly',
+    BigInt64Array: 'readonly',
+    fetch: 'readonly'
+  }
+}

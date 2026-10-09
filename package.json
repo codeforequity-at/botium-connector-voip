@@ -1,10 +1,12 @@
 {
   "name": "botium-connector-voip",
-  "version": "0.0.34",
+  "version": "0.0.45",
   "description": "Botium Voice over IP Connector",
   "main": "dist/botium-connector-voip-cjs.js",
   "module": "dist/botium-connector-voip-es.js",
   "scripts": {
+    "clean:dist": "rm -rf dist",
+    "build:dist": "npm run clean:dist && rollup -c",
     "build": "npm run eslint && rollup -c",
     "eslint": "eslint index.js src",
     "eslint-fix": "eslint --fix index.js src",
@@ -12,6 +14,12 @@
   },
   "author": "Botium GmbH",
   "license": "MIT",
+  "files": [
+    "assets",
+    "dist",
+    "index.js",
+    "src"
+  ],
   "devDependencies": {
     "@babel/core": "^7.9.0",
     "@babel/node": "^7.8.7",
@@ -31,13 +39,19 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.9.2",
+    "@huggingface/transformers": "^4.2.0",
     "axios": "^1.17.0",
     "debug": "^4.1.1",
     "lodash": "^4.18.1",
     "music-metadata": "^7.14.0",
+    "onnxruntime-node": "^1.21.0",
     "ws": "^8.21.0"
   },
   "peerDependencies": {
     "botium-core": ">= 1.7.3"
+  },
+  "overrides": {
+    "sharp": "0.34.5",
+    "undici": "6.29.0"
   }
 }
