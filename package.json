@@ -5,7 +5,7 @@
   "main": "dist/botium-connector-voip-cjs.js",
   "module": "dist/botium-connector-voip-es.js",
   "scripts": {
-    "clean:dist": "npm run clean:dist && rollup -c",
+    "clean:dist": "rm -rf dist",
     "build:dist": "npm run clean:dist && rollup -c",
     "build": "npm run eslint && rollup -c",
     "eslint": "eslint index.js src",
