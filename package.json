@@ -5,7 +5,7 @@
   "main": "dist/botium-connector-voip-cjs.js",
   "module": "dist/botium-connector-voip-es.js",
   "scripts": {
-    "clean:dist": "rm -rf dist",
+    "clean:dist": "npm run clean:dist && rollup -c",
     "build:dist": "npm run clean:dist && rollup -c",
     "build": "npm run eslint && rollup -c",
     "eslint": "eslint index.js src",
@@ -49,5 +49,9 @@
   },
   "peerDependencies": {
     "botium-core": ">= 1.7.3"
+  },
+  "overrides": {
+    "sharp": "0.34.5",
+    "undici": "6.29.0"
   }
 }
