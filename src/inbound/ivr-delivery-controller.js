@@ -62,7 +62,8 @@ function createIvrDeliveryController ({
     const quietMs = deliveryQuietMs()
     const capMs = maxDeliveryWaitMs()
 
-    while (token === cancelToken) {
+    for (;;) {
+      if (token !== cancelToken) break
       const lastFinalAt = getLastSttFinalAt() || started
       const elapsed = Date.now() - started
       if (elapsed >= capMs) break

@@ -31,7 +31,7 @@ class PsstTurnHandler {
 
   armJoinSilenceTimer () {
     const ctx = this.ctx
-    const { botMsgs, caps, convoStep, sessionId, eventEmitter, _info, debug } = ctx
+    const { botMsgs, convoStep, sessionId, eventEmitter, _info, debug } = ctx
     if (!botMsgs || botMsgs.length === 0) return
     if (!ctx.isJoinMethod()) return
 
