@@ -88,6 +88,27 @@ module.exports = {
         type: 'boolean',
         required: false,
         advanced: true
+      },
+      {
+        name: 'VOIP_NAMO_EOU_THRESHOLD',
+        label: 'Namo end-of-utterance confidence threshold',
+        type: 'string',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_NAMO_REOPEN_MS',
+        label: 'Namo soft-end reopen window (ms)',
+        type: 'int',
+        required: false,
+        advanced: true
+      },
+      {
+        name: 'VOIP_TEN_VAD_MODEL_PATH',
+        label: 'TEN VAD ONNX path (default bundled ten-vad.int8.onnx)',
+        type: 'string',
+        required: false,
+        advanced: true
       }
     ]
   },
@@ -97,3 +118,6 @@ module.exports = {
     VOIP_CONFIDENCE_THRESHOLD: ConfidenceThresholdLogicHook
   }
 }
+
+module.exports.applyOtsLatencyProfile = require('./src/reply-budget').applyOtsLatencyProfile
+module.exports.CapabilitiesReplyBudget = require('./src/reply-budget')
