@@ -15,6 +15,7 @@ const { resolveCedTinyModelPath } = require('./audio-tagging/ced-tiny-model')
 const { InboundLane } = require('./inbound/inbound-lane')
 const { InboundSceneClassifier } = require('./audio-tagging/inbound-scene-classifier')
 const { waitForOutboundAllowed } = require('./inbound/outbound-gate')
+const { shouldStopAgentPlayback, inboundOverlapsAgentPlayback } = require('./inbound/playback-stop')
 const {
   speechEndAtMsFromFinal,
   computeConnectorDeadlineMs,
@@ -591,6 +592,7 @@ class BotiumConnectorVoip {
 
     const commitNamoFlush = (botMsg) => {
       if (!connector.botMsgs || connector.botMsgs.length === 0) return
+      connector._namoFlushSeq = (connector._namoFlushSeq || 0) + 1
       sendBotMsg(botMsg)
       connector.firstMsg = false
       connector.joinLastPrevMsg = connector.botMsgs[connector.botMsgs.length - 1]
@@ -1327,6 +1329,13 @@ class BotiumConnectorVoip {
                   : null)
               const agentEndSec = _.isFinite(playbackSec) ? playedSec + playbackSec : undefined
               this._logReplyTraceHeard(agentEndSec)
+              const playbackAtMs = _.isFinite(playbackData.playbackAtMs)
+                ? playbackData.playbackAtMs
+                : Date.now()
+              const requestedMs = _.isFinite(active.playbackRequestedDurationMs)
+                ? active.playbackRequestedDurationMs
+                : (_.isFinite(playbackSec) ? playbackSec * 1000 : 0)
+              this._refineAgentPlaybackWindow(playbackAtMs, requestedMs, playbackData.wireKind || active.wireKind)
             }
           }
 
@@ -1347,6 +1356,7 @@ class BotiumConnectorVoip {
             // fragment open to be joined instead of flushed on its own. Bounded by the same
             // extension budget as partial-driven re-arms to prevent infinite stranding.
             _info('speech_resumed', { sessionId: this.sessionId })
+            const overlapNoted = connector._handleInboundDuringAgentPlayback()
             if (this.eventEmitter) {
               try {
                 this.eventEmitter.emit('voip.botActivity', {
@@ -1356,7 +1366,7 @@ class BotiumConnectorVoip {
               } catch (err) { /* ignore */ }
             }
             const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-            if (isEouHandling(sttHandling) && this.botMsgs && this.botMsgs.length > 0) {
+            if (isEouHandling(sttHandling) && ((this.botMsgs && this.botMsgs.length > 0) || overlapNoted)) {
               connector.turnHandler.onSpeechResumed(true)
             } else {
               const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
@@ -1413,6 +1423,14 @@ class BotiumConnectorVoip {
               bufferedChunks: (this.botMsgs && this.botMsgs.length) || 0,
               timerActive: !!(connector.turnHandler && connector.turnHandler.silenceTimerActive)
             })
+            if (isEouHandling(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING])) {
+              connector._handleInboundDuringAgentPlayback()
+              if (connector.turnHandler && typeof connector.turnHandler.onPartialNewUtterance === 'function' &&
+                typeof partialText === 'string' && partialText.trim().length > 0 &&
+                (!this.botMsgs || this.botMsgs.length === 0 || partialLooksLikeNewUtterance(partialText, this.botMsgs))) {
+                connector.turnHandler.onPartialNewUtterance()
+              }
+            }
             // Emit liveness keep-alive so waiters can distinguish "bot silent"
             // from "bot streaming partials between finals".
             if (this.caps[Capabilities.VOIP_EMIT_SPECULATIVE_TEXT] && this.eventEmitter && typeof partialText === 'string' && partialText.trim().length > 0) {
@@ -1507,6 +1525,9 @@ class BotiumConnectorVoip {
             if (successfulConfidenceScore) {
               this._captureSttFinalForReplyTrace(parsedData, msgPreview)
             }
+            if (successfulConfidenceScore && isEouHandling(this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING])) {
+              connector._handleInboundDuringAgentPlayback()
+            }
             // ORIGINAL: always emit final message immediately (ignore JOIN hooks/rules).
             if (this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING] === 'ORIGINAL') {
               let botMsg = { messageText: normalizedMsgText }
@@ -1578,9 +1599,7 @@ class BotiumConnectorVoip {
                   recordingAtSttFinalSec,
                   speechEndSec
                 })
-                if (Number.isFinite(speechEndAt)) {
-                  this._turnSpeechEndAtMs = speechEndAt
-                }
+                this._turnSpeechEndAtMs = Number.isFinite(speechEndAt) ? speechEndAt : null
                 if (this._ivrDelivery && this._ivrDelivery.cancelPending) {
                   this._ivrDelivery.cancelPending()
                 }
@@ -1719,6 +1738,8 @@ class BotiumConnectorVoip {
         try {
           let duration = 0
           const skipTtsForMixedInput = hasVoiceMedia
+          const flushSeqAtStart = this._namoFlushSeq || 0
+          const botChunksAtStart = (this.botMsgs && this.botMsgs.length) || 0
           debug(`UserSays routing: hasText=${hasText} hasVoiceMedia=${hasVoiceMedia} skipTtsForMixedInput=${skipTtsForMixedInput}`)
 
           const awaitOutboundGate = async () => {
@@ -1745,9 +1766,16 @@ class BotiumConnectorVoip {
               hasRecentSttPartial: () => {
                 const t = this._lastSttPartialAt
                 return _.isFinite(t) && (Date.now() - t) < partialMs
+              },
+              shouldAbort: () => {
+                if ((this._namoFlushSeq || 0) > flushSeqAtStart) return true
+                const chunks = (this.botMsgs && this.botMsgs.length) || 0
+                return chunks > botChunksAtStart
               }
             })
-            if (gate.reason === 'max_wait' && gate.sttOrSpeechActive) {
+            if (gate.aborted) {
+              _info('outbound_gate_aborted', { sessionId: this.sessionId, ...gate })
+            } else if (gate.reason === 'max_wait' && gate.sttOrSpeechActive) {
               _info('outbound_gate_forced', { sessionId: this.sessionId, ...gate })
             }
             _info('outbound_gate', { sessionId: this.sessionId, ...gate })
@@ -1755,8 +1783,18 @@ class BotiumConnectorVoip {
           }
           const willSendWire = hasDtmf || dtmfMatch || hasVoiceMedia ||
             (hasText && !skipTtsForMixedInput && (this.axiosTtsParams || hasVoiceMedia))
+          let outboundGateResult = null
           if (willSendWire) {
-            await awaitOutboundGate()
+            outboundGateResult = await awaitOutboundGate()
+          }
+          if (outboundGateResult && outboundGateResult.aborted) {
+            msg.voipAgent = {
+              wireSentAtMs: null,
+              abortedByInbound: true,
+              reason: outboundGateResult.reason || 'superseded_by_inbound',
+              inputType
+            }
+            return resolve()
           }
 
           // Stamp `msg.voipAgent` at the moment bytes leave the WebSocket so
@@ -1766,8 +1804,9 @@ class BotiumConnectorVoip {
           const recordingSecNow = () => this._recordingSecNow()
           const stampAgentWire = (wireKind, requestedDurationMs, extras = {}) => {
             const wireRecordingStartSec = recordingSecNow()
+            const wireSentAtMs = Date.now()
             msg.voipAgent = {
-              wireSentAtMs: Date.now(),
+              wireSentAtMs,
               inputType,
               wireKind,
               requestedDurationMs: Math.max(0, Math.round(requestedDurationMs || 0)),
@@ -1781,6 +1820,9 @@ class BotiumConnectorVoip {
             }
             this._activeUserSaysVoipAgent = msg.voipAgent
             this._captureAgentWire(msg.voipAgent, inputType)
+            if (wireKind === 'tts' || wireKind === 'media') {
+              this._openAgentPlaybackWindow(wireKind, wireSentAtMs, msg.voipAgent.requestedDurationMs)
+            }
           }
           const sendAgentWire = (request) => {
             this._sendUserSaysWs(request)
@@ -2489,6 +2531,67 @@ class BotiumConnectorVoip {
 
   _voipWsCanSend () {
     return !this.stopCalled && this.ws && this.ws.readyState === WebSocket.OPEN
+  }
+
+  _openAgentPlaybackWindow (wireKind, startAtMs, durationMs) {
+    const start = Number(startAtMs)
+    const dur = Math.max(0, Number(durationMs) || 0)
+    if (!Number.isFinite(start)) return
+    this._agentPlaybackWindow = {
+      wireKind,
+      startAtMs: start,
+      endAtMs: start + dur,
+      stopped: false
+    }
+  }
+
+  _refineAgentPlaybackWindow (playbackAtMs, requestedDurationMs, wireKind) {
+    const start = Number(playbackAtMs)
+    const dur = Math.max(0, Number(requestedDurationMs) || 0)
+    if (!Number.isFinite(start)) return
+    const prev = this._agentPlaybackWindow
+    this._agentPlaybackWindow = {
+      wireKind: wireKind || (prev && prev.wireKind) || 'tts',
+      startAtMs: start,
+      endAtMs: start + dur,
+      stopped: !!(prev && prev.stopped)
+    }
+  }
+
+  _maybeStopAgentPlaybackForInbound (nowMs = Date.now()) {
+    const playback = this._agentPlaybackWindow
+    if (!shouldStopAgentPlayback({ playback, nowMs })) return false
+    playback.stopped = true
+    if (this._voipWsCanSend() && this.sessionId) {
+      try {
+        this.ws.send(JSON.stringify({ METHOD: 'stopAudio', sessionId: this.sessionId }))
+      } catch (_) { /* best-effort */ }
+    }
+    _info('agent_playback_stopped', {
+      sessionId: this.sessionId,
+      wireKind: playback.wireKind,
+      startAtMs: playback.startAtMs,
+      endAtMs: playback.endAtMs
+    })
+    return true
+  }
+
+  /**
+   * @returns {boolean} true when overlap was noted on the turn handler
+   */
+  _maybeNotePlaybackOverlap (nowMs = Date.now()) {
+    if (!inboundOverlapsAgentPlayback({ playback: this._agentPlaybackWindow, nowMs })) return false
+    if (this.turnHandler && typeof this.turnHandler.notePlaybackOverlap === 'function') {
+      this.turnHandler.notePlaybackOverlap()
+      return true
+    }
+    return false
+  }
+
+  _handleInboundDuringAgentPlayback () {
+    const nowMs = Date.now()
+    this._maybeStopAgentPlaybackForInbound(nowMs)
+    return this._maybeNotePlaybackOverlap(nowMs)
   }
 
   _sendUserSaysWs (request) {

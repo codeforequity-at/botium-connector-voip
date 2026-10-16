@@ -107,6 +107,10 @@ class NamoTurnHandler {
     if (this.namoEnabled) this.gate.noteAgentDtmf()
   }
 
+  notePlaybackOverlap () {
+    if (this.namoEnabled) this.gate.notePlaybackOverlap()
+  }
+
   onInboundVadSpeechStart () {
     if (this.namoEnabled) this.gate.onVadSpeechStart()
   }
@@ -134,7 +138,9 @@ class NamoTurnHandler {
   onPartialNewUtterance () {
     if (!this.namoEnabled) {
       this._getPsstFallback().onPartialNewUtterance()
+      return
     }
+    this.gate.onPartialNewUtterance()
   }
 
   forceFlush (reason) {

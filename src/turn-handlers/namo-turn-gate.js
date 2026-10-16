@@ -4,8 +4,11 @@ const TURN_BUFFERING = 'buffering'
 const TURN_SOFT_ENDED = 'soft_ended'
 const DEFAULT_MEDIAN_GAP_MS = 400
 const MAX_GAP_SAMPLES = 12
+const OVERLAP_REARM_CAP_MS = 60000
+const INBOUND_SPEECH_HOLD_MS = 1800
 const HANDLING_EOU = 'EOU'
 const QUESTION_FRAGMENT_DENY_RE = /^how can i\??$/i
+const LEADING_REPROMPT_CHECKIN_RE = /^(?:hello[,.\s]+)?are you still there\??$/i
 
 const numberCapability = (caps, name, fallback, { min = 0, max = Number.MAX_SAFE_INTEGER } = {}) => {
   const parsed = Number(caps[name])
@@ -106,6 +109,11 @@ class NamoTurnGate {
     this.lastDecisionComplete = false
     this.lastEouProbability = null
     this.maxWaitExtended = false
+    this.playbackOverlap = false
+    this.overlapFirstRearmAt = null
+    this.overlapRearmCount = 0
+    this.lastInboundSpeechAt = null
+    this.hasPartialSinceFinal = false
   }
 
   get _messages () { return this._getMessages() || [] }
@@ -148,17 +156,70 @@ class NamoTurnGate {
 
   _resolveReopenDelay (result) {
     const eou = result && result.eouProbability
-    if (Number.isFinite(eou) && eou >= this.reopenFastEou && !this._shouldHoldForVad()) {
+    if (
+      !this.playbackOverlap &&
+      Number.isFinite(eou) &&
+      eou >= this.reopenFastEou &&
+      !this._shouldHoldForVad()
+    ) {
       return Math.min(this.reopenMs, this.reopenFastMs)
     }
     return this.reopenMs
   }
 
   _shouldSkipReopenAfterEmitStable (result) {
+    if (this.playbackOverlap) return false
     if (!this.emitStableSatisfiedAt || this.emitStableMs <= 0) return false
-    if (this._messages.length !== 1 || this._shouldHoldForVad()) return false
+    if (this._messages.length !== 1 || this._shouldHoldForVad() || this._hasRecentInboundSpeechSinceFinal()) return false
+    const lastText = this._lastSegmentText()
+    if (!/\?\s*$/.test(lastText)) return false
     const eou = result && result.eouProbability
     return Number.isFinite(eou) && eou >= this.threshold
+  }
+
+  _hasRecentInboundSpeechSinceFinal () {
+    if (this.lastInboundSpeechAt == null || !this._messages.length) return false
+    if (this.lastFinalAt != null && this.lastInboundSpeechAt <= this.lastFinalAt) return false
+    return Date.now() - this.lastInboundSpeechAt < INBOUND_SPEECH_HOLD_MS
+  }
+
+  _hasActiveContinuation () {
+    return this._shouldHoldForVad() || this.hasPartialSinceFinal
+  }
+
+  notePlaybackOverlap () {
+    this.playbackOverlap = true
+    this._info('namo_playback_overlap_noted', {
+      sessionId: this.sessionId,
+      bufferedChunks: this._messages.length,
+      turnState: this.turnState
+    })
+  }
+
+  _clearOverlapState () {
+    this.playbackOverlap = false
+    this.overlapFirstRearmAt = null
+    this.overlapRearmCount = 0
+  }
+
+  _maybeRearmOverlapMaxWait (reason) {
+    if (this.turnState !== TURN_BUFFERING) return false
+    if (!this.playbackOverlap || this.lastDecisionComplete) return false
+    if (!this._messages.length) return false
+    const now = Date.now()
+    if (this.overlapFirstRearmAt == null) this.overlapFirstRearmAt = now
+    if (now - this.overlapFirstRearmAt >= OVERLAP_REARM_CAP_MS) return false
+    this.overlapRearmCount += 1
+    this.pendingStartedAt = now
+    this._armMaxWaitTimer(reason)
+    this._info('namo_max_wait_rearmed', {
+      sessionId: this.sessionId,
+      reason,
+      rearmCount: this.overlapRearmCount,
+      msSinceFirstRearm: now - this.overlapFirstRearmAt,
+      bufferedChunks: this._messages.length
+    })
+    return true
   }
 
   noteAgentDtmf () {
@@ -174,6 +235,7 @@ class NamoTurnGate {
   }
 
   onVadSpeechStart () {
+    this.lastInboundSpeechAt = Date.now()
     this._info('namo_vad_speech_start', {
       sessionId: this.sessionId,
       bufferedChunks: this._messages.length,
@@ -189,6 +251,9 @@ class NamoTurnGate {
     this._clearQuestionFlushTimer()
     this._clearReopenTimer()
     this._startMaxWaitClockIfNeeded('vad_speech_start')
+    if (!this._maybeRearmOverlapMaxWait('vad_speech_start') && this.pendingStartedAt != null) {
+      this._armMaxWaitTimer('vad_speech_start')
+    }
   }
 
   onVadSpeechEnd () {
@@ -228,13 +293,35 @@ class NamoTurnGate {
   }
 
   onSpeechResumed () {
+    this.lastInboundSpeechAt = Date.now()
     if (this.turnState === TURN_SOFT_ENDED && this._messages.length) {
       this._reopenTurn('speech_resumed')
+      return
+    }
+    this._maybeRearmOverlapMaxWait('speech_resumed')
+  }
+
+  onPartialNewUtterance () {
+    this.lastInboundSpeechAt = Date.now()
+    this.hasPartialSinceFinal = true
+    this._clearEmitStableTimer()
+    if (this.turnState === TURN_SOFT_ENDED && this._messages.length) {
+      this._reopenTurn('stt_partial')
+      return
+    }
+    if (this._messages.length) {
+      this._clearQuestionFlushTimer()
+      this._clearReopenTimer()
+    }
+    if (!this._maybeRearmOverlapMaxWait('stt_partial') && this._messages.length && this.pendingStartedAt != null) {
+      this._armMaxWaitTimer('stt_partial')
     }
   }
 
   onFinalBuffered () {
     const gapMs = this._recordFinalGap()
+    this.lastInboundSpeechAt = null
+    this.hasPartialSinceFinal = false
     if (this.turnState === TURN_SOFT_ENDED) this._reopenTurn('stt_final')
     this._maybeSplitOnOutlierGap(gapMs)
     this._openTurnIfNeeded()
@@ -267,7 +354,7 @@ class NamoTurnGate {
     this._armQuestionFlushTimer()
     const joinedText = this._joinedText()
     const lastSegmentText = this._lastSegmentText()
-    if (this._shouldFlushJoinedQuestionStt(joinedText, lastSegmentText)) {
+    if (!this.playbackOverlap && this._shouldFlushJoinedQuestionStt(joinedText, lastSegmentText)) {
       this.decisionChain = this.decisionChain
         .then(() => this._tryCohesionEmit(Date.now()))
         .catch(err => this._handleInferenceError(err))
@@ -299,6 +386,9 @@ class NamoTurnGate {
     this.lastEouProbability = null
     this.maxWaitExtended = false
     this.pendingStartedAt = null
+    this.lastInboundSpeechAt = null
+    this.hasPartialSinceFinal = false
+    this._clearOverlapState()
   }
 
   get timersActive () {
@@ -364,15 +454,15 @@ class NamoTurnGate {
   }
 
   _requestSemanticFlush (reason, result) {
-    if (this._shouldHoldForVad()) {
+    if (this._shouldHoldForVad() || this._hasRecentInboundSpeechSinceFinal()) {
       this.pendingVadFlush = true
       this.pendingVadResult = result
       this.pendingVadReason = reason === 'model_complete' ? 'model_complete_vad' : reason
       this.turnState = TURN_BUFFERING
       this._info('namo_vad_hold', {
-        reason,
+        reason: this._shouldHoldForVad() ? reason : 'inbound_speech_since_final',
         bufferedChunks: this._messages.length,
-        vadSpeechActive: true
+        vadSpeechActive: this._getVadSpeechActive()
       })
       return
     }
@@ -547,7 +637,17 @@ class NamoTurnGate {
   }
 
   _joinedText () {
-    return this._messages.map(message => message.messageText).join(this.delimiter)
+    const msgs = this._messages
+    if (msgs.length > 1) {
+      const firstText = String(msgs[0]?.messageText || '').trim()
+      if (LEADING_REPROMPT_CHECKIN_RE.test(firstText)) {
+        const rest = msgs.slice(1).map(m => String(m?.messageText || '').trim()).filter(Boolean)
+        if (rest.length > 0 && rest.join(' ').length >= this.minSegmentChars) {
+          return rest.join(this.delimiter)
+        }
+      }
+    }
+    return msgs.map(message => message.messageText).join(this.delimiter)
   }
 
   _lastSegmentText () {
@@ -566,12 +666,32 @@ class NamoTurnGate {
 
   _shouldFlushJoinedQuestionStt (joinedText, lastSegmentText) {
     if (!this.joinedQuestionFlushEnable) return false
+    if (this.playbackOverlap) return false
     const chunks = this._messages.length
     if (chunks < 2 || chunks > this.joinedQuestionMaxChunks) return false
     if (this._shouldHoldForVad()) return false
     const last = String(lastSegmentText || '').trim()
-    if (!last || QUESTION_FRAGMENT_DENY_RE.test(last)) return false
+    if (!last || QUESTION_FRAGMENT_DENY_RE.test(last) || LEADING_REPROMPT_CHECKIN_RE.test(last)) return false
     if (!/\?\s*$/.test(last)) return false
+    const conf = this._lastSegmentSttConfidence()
+    if (conf == null || conf < this.joinedQuestionMinConfidence) return false
+    const joined = String(joinedText || '').trim()
+    if (!joined.includes(last)) return false
+    return true
+  }
+
+  _shouldFlushStableQuestionStt (joinedText, lastSegmentText) {
+    if (!this.joinedQuestionFlushEnable) return false
+    if (this.playbackOverlap) return false
+    const chunks = this._messages.length
+    if (chunks < 1 || chunks > this.joinedQuestionMaxChunks) return false
+    if (this._shouldHoldForVad()) return false
+    const last = String(lastSegmentText || '').trim()
+    if (!last || QUESTION_FRAGMENT_DENY_RE.test(last) || LEADING_REPROMPT_CHECKIN_RE.test(last)) return false
+    if (!/\?\s*$/.test(last)) return false
+    if (chunks === 1 && !/\b(right|correct)\?\s*$/i.test(last)) {
+      return false
+    }
     const conf = this._lastSegmentSttConfidence()
     if (conf == null || conf < this.joinedQuestionMinConfidence) return false
     const joined = String(joinedText || '').trim()
@@ -604,9 +724,9 @@ class NamoTurnGate {
   async _tryCohesionEmit (armedAt = Date.now()) {
     if (!this._messages.length) return false
 
-    if (this._shouldHoldForVad()) {
+    if (this._shouldHoldForVad() || this._hasRecentInboundSpeechSinceFinal()) {
       this._info('namo_cohesion_hold', {
-        reason: 'vad_speech_active',
+        reason: this._shouldHoldForVad() ? 'vad_speech_active' : 'inbound_speech_since_final',
         bufferedChunks: this._messages.length
       })
       return false
@@ -662,7 +782,7 @@ class NamoTurnGate {
       return false
     }
 
-    if (!joinedComplete && this._shouldFlushJoinedQuestionStt(joinedText, lastText)) {
+    if (!joinedComplete && this._shouldFlushStableQuestionStt(joinedText, lastText)) {
       this._info('namo_joined_question_stt_flush', {
         bufferedChunks: this._messages.length,
         sttConfidence: this._lastSegmentSttConfidence(),
@@ -693,7 +813,8 @@ class NamoTurnGate {
   _armMaxWaitTimer (armReason) {
     this._clearMaxWaitTimer()
     const now = Date.now()
-    const deadlineAtMs = this._getReplyConnectorDeadlineAtMs()
+    const skipReplyDeadline = (this.playbackOverlap && !this.lastDecisionComplete) || this._hasActiveContinuation()
+    const deadlineAtMs = skipReplyDeadline ? null : this._getReplyConnectorDeadlineAtMs()
     const { remainingMs, cappedByDeadline } = computeMaxWaitRemainingMs({
       anchorMs: this.pendingStartedAt,
       maxWaitMs: this.maxWaitMs,
@@ -732,14 +853,15 @@ class NamoTurnGate {
       return
     }
     this.maxWaitTimer = setTimeout(() => {
-      const replyDeadline = this._getReplyConnectorDeadlineAtMs()
+      const skipDeadlineNow = (this.playbackOverlap && !this.lastDecisionComplete) || this._hasActiveContinuation()
+      const replyDeadline = skipDeadlineNow ? null : this._getReplyConnectorDeadlineAtMs()
       if (Number.isFinite(replyDeadline) && Date.now() >= replyDeadline) {
         finishMaxWait()
         return
       }
       const shouldExtend = !this.maxWaitExtended &&
         this.maxWaitVadExtensionMs > 0 &&
-        this._shouldHoldForVad() &&
+        this._hasActiveContinuation() &&
         !(Number.isFinite(replyDeadline) && Date.now() >= replyDeadline)
       if (shouldExtend) {
         this.maxWaitExtended = true
@@ -944,6 +1066,9 @@ class NamoTurnGate {
     this.pendingVadFlush = false
     this.pendingVadResult = null
     this.pendingVadReason = null
+    this.lastInboundSpeechAt = null
+    this.hasPartialSinceFinal = false
+    this._clearOverlapState()
     this._commitFlush(message)
   }
 
