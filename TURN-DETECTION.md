@@ -31,7 +31,8 @@ Objective tests with `VOIP_OTS_LATENCY_PROFILE` default handling to **EOU** when
 - `VOIP_NAMO_MAX_WAIT_VAD_EXTENSION_MS` — one-time extension before `max_wait` flush **only when TEN VAD reports speech active** (connector default 1500; OTS profile sets 0).
 - `VOIP_NAMO_JOINED_QUESTION_FLUSH_*` — when Namo joined-EOU is low but the last STT chunk is a high-confidence `?` prompt (≤2 chunks), commit the **joined** text without splitting (ATT Spanish + intent menu); cohesion runs immediately on the second final (no extra emit-stable wait).
 - **Max-wait clock** — `pendingStartedAt` anchors to `speechEndSec` from the latest STT final when available; a later final **re-anchors** so multi-chunk IVR menus measure `max_wait` from the last speech end, not the first chunk arrival.
-- **Reply budget** — when `VOIP_REPLY_BUDGET_MS` > 0, `max_wait` is capped so flush occurs by `speechEnd + (budget − coach − wire)` (floor 800ms), preserving coach/wire time for the 5s wire SLO (`namo_max_wait_deadline_cap` in logs).
+- **Reply budget** — when `VOIP_REPLY_BUDGET_MS` > 0, `max_wait` is capped so flush occurs by `speechEnd + (budget − coach − wire)` (floor 800ms), preserving coach/wire time for the 5s wire SLO (`namo_max_wait_deadline_cap` in logs). **Barge-in overlap:** when IVR speech overlaps agent TTS/media playback (`namo_playback_overlap_noted`), Namo-incomplete buffers skip this deadline cap so the full `VOIP_NAMO_MAX_WAIT_MS` hold can join a continuation; `speech_resumed`, TEN VAD speech start, and STT partials re-arm that hold (60s cap, `namo_max_wait_rearmed`). Overlapped turns do not use emit-stable reopen bypass (`_shouldSkipReopenAfterEmitStable`).
+- **Agent playback yield** — on `speech_resumed` / STT while agent TTS or media is still within its playback window, the connector sends one `stopAudio` to the VoIP worker (after a 400ms echo guard) and logs `agent_playback_stopped`. DTMF is not stopped.
 
 ### TEN VAD (inbound lane)
 
@@ -44,7 +45,7 @@ When `VOIP_HALF_DUPLEX_ENABLE` is true (default), `UserSays` wire audio waits on
 
 - **Soft wait** — reply-budget wire reserve (~800ms when `VOIP_REPLY_BUDGET_MS` is set).
 - **Hard wait** — up to `VOIP_OUTBOUND_GATE_MAX_WAIT_MS` (default 5000ms) while **STT partials** (`VOIP_OUTBOUND_GATE_STT_PARTIAL_MS`, default 1500ms lookback) or **TEN VAD `speechActive`** block.
-- Agent audio is not forced on wire at the soft cap if the IVR is still active; `outbound_gate_forced` logs a last-resort `max_wait` at the hard cap.
+- Agent audio is not forced on wire at the soft cap if the IVR is still active. At the hard cap, if inbound speech/STT still blocks or a new Namo flush arrived during the wait (`_namoFlushSeq`), the send is **aborted** (`outbound_gate_aborted`, `superseded_by_inbound`) instead of talking over the IVR; the coach treats the turn as wire-aborted and accepts the next bot utterance without `[VOIP-STALE-BOT]`.
 
 ```mermaid
 stateDiagram-v2

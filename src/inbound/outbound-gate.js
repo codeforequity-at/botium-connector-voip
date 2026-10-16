@@ -13,7 +13,8 @@ async function waitForOutboundAllowed ({
   hardMaxWaitMs,
   maxWaitMs,
   pollMs = 50,
-  hasRecentSttPartial = () => false
+  hasRecentSttPartial = () => false,
+  shouldAbort = () => false
 }) {
   const quiet = Math.max(0, Number(quietMs) || 430)
   const soft = Math.max(quiet, Number(softMaxWaitMs ?? maxWaitMs) || 5000)
@@ -33,6 +34,14 @@ async function waitForOutboundAllowed ({
   }
 
   while (Date.now() < hardDeadline) {
+    if (shouldAbort()) {
+      return {
+        waitedMs: Date.now() - start,
+        allowed: false,
+        aborted: true,
+        reason: 'superseded_by_inbound'
+      }
+    }
     if (!inboundLane) {
       return { waitedMs: Date.now() - start, allowed: true, reason: 'no_lane' }
     }
@@ -44,11 +53,19 @@ async function waitForOutboundAllowed ({
   }
 
   const sttOrSpeechActive = isBlocked()
+  if (shouldAbort() || sttOrSpeechActive) {
+    return {
+      waitedMs: Date.now() - start,
+      allowed: false,
+      aborted: true,
+      reason: 'superseded_by_inbound',
+      ...(sttOrSpeechActive ? { sttOrSpeechActive: true } : {})
+    }
+  }
   return {
     waitedMs: Date.now() - start,
     allowed: true,
-    reason: 'max_wait',
-    ...(sttOrSpeechActive ? { sttOrSpeechActive: true } : {})
+    reason: 'max_wait'
   }
 }
 
