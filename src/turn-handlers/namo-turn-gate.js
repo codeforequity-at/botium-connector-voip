@@ -1,5 +1,16 @@
 const { computeMaxWaitRemainingMs } = require('../reply-budget')
 const DIGIT_ONLY_RE = /^[\d\s.,#-]+$/
+const READBACK_PREFIX_RE = /^(?:to confirm|confirming)\s+[\d\s.,#-]+$/i
+
+function isIncompleteReadbackChunk (lastText, joinedText) {
+  const last = String(lastText || '').trim()
+  const joined = String(joinedText || '').trim()
+  if (!last) return false
+  if (/\?\s*$/.test(joined)) return false
+  if (DIGIT_ONLY_RE.test(last)) return true
+  if (READBACK_PREFIX_RE.test(last)) return true
+  return false
+}
 const TURN_BUFFERING = 'buffering'
 const TURN_SOFT_ENDED = 'soft_ended'
 const DEFAULT_MEDIAN_GAP_MS = 400
@@ -555,6 +566,10 @@ class NamoTurnGate {
     return last && typeof last.messageText === 'string' ? last.messageText.trim() : ''
   }
 
+  _isIncompleteReadbackChunk (lastText, joinedText) {
+    return isIncompleteReadbackChunk(lastText, joinedText)
+  }
+
   _lastSegmentSttConfidence () {
     const last = this._messages[this._messages.length - 1]
     if (!last || last.sourceData == null) return null
@@ -673,6 +688,14 @@ class NamoTurnGate {
     }
 
     if (joinedComplete || forceQuestionFlush) {
+      if (this._isIncompleteReadbackChunk(lastText, joinedText)) {
+        this._info('namo_cohesion_hold', {
+          reason: 'incomplete_readback_chunk',
+          bufferedChunks: this._messages.length,
+          preview: joinedText.substring(0, 160)
+        })
+        return false
+      }
       const reason = forceQuestionFlush ? 'question_heuristic' : 'model_complete'
       if (this._shouldSkipReopenAfterEmitStable(joinedResult)) {
         this._flushPending(reason, joinedResult)
@@ -683,6 +706,14 @@ class NamoTurnGate {
     }
 
     if (segmentComplete && this._messages.length === 1) {
+      if (this._isIncompleteReadbackChunk(lastText, joinedText)) {
+        this._info('namo_cohesion_hold', {
+          reason: 'incomplete_readback_chunk',
+          bufferedChunks: this._messages.length,
+          preview: joinedText.substring(0, 160)
+        })
+        return false
+      }
       this._requestSemanticFlush('model_complete', segmentResult)
       return true
     }
@@ -844,6 +875,14 @@ class NamoTurnGate {
       })
     }
     if (complete) {
+      if (this._isIncompleteReadbackChunk(lastText, text)) {
+        this._info('namo_cohesion_hold', {
+          reason: 'incomplete_readback_chunk',
+          bufferedChunks: this._messages.length,
+          preview: text.substring(0, 160)
+        })
+        return
+      }
       if (this.vadEnabled && this._messages.length === 1 && !this._shouldHoldForVad()) {
         if (this.emitStableMs <= 0) {
           this._requestSemanticFlush('model_complete', result)
@@ -952,4 +991,4 @@ class NamoTurnGate {
   }
 }
 
-module.exports = { NamoTurnGate, TURN_BUFFERING, TURN_SOFT_ENDED, HANDLING_EOU }
+module.exports = { NamoTurnGate, TURN_BUFFERING, TURN_SOFT_ENDED, HANDLING_EOU, isIncompleteReadbackChunk }
