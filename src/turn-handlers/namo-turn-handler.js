@@ -141,7 +141,11 @@ class NamoTurnHandler {
     if (this.namoEnabled) {
       this.gate.forceFlush(reason)
     } else if (this.ctx.botMsgs && this.ctx.botMsgs.length > 0) {
-      this.ctx.flushBufferedBotMsgs()
+      if (typeof this.ctx.realFlush === 'function') {
+        this.ctx.realFlush()
+      } else {
+        this.ctx.flushBufferedBotMsgs()
+      }
     }
   }
 

@@ -78,7 +78,11 @@ class PsstTurnHandler {
           outcome: 'emit'
         })
         debug('Silence Duration Timeout (JOIN/PSST):', effectiveWindowMs, 'ms')
-        ctx.flushBufferedBotMsgs()
+        if (typeof ctx.realFlush === 'function') {
+          ctx.realFlush()
+        } else {
+          ctx.flushBufferedBotMsgs()
+        }
       } else {
         _info('psst_timer_fired', {
           sessionId,

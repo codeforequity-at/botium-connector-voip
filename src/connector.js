@@ -587,7 +587,7 @@ class BotiumConnectorVoip {
       _info
     })
     connector._ivrDelivery = { cancelPending: () => {} }
-    const flushBufferedBotMsgs = () => {}
+    const flushBufferedBotMsgs = flushBufferedBotMsgsImmediate
 
     const commitNamoFlush = (botMsg) => {
       if (!connector.botMsgs || connector.botMsgs.length === 0) return
@@ -1359,7 +1359,7 @@ class BotiumConnectorVoip {
             if (isEouHandling(sttHandling) && this.botMsgs && this.botMsgs.length > 0) {
               connector.turnHandler.onSpeechResumed(true)
             } else {
-              const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST' || sttHandling === 'CONCAT' || this._hasJoinLogicHookOrRule(this.convoStep)
+              const isJoinMethod = isBufferedSttHandling(sttHandling) || this._hasJoinLogicHookOrRule(this.convoStep)
               if (isJoinMethod && this.botMsgs && this.botMsgs.length > 0) {
                 const MAX_EXTENSION_MS = 60000
                 const now = Date.now()
@@ -1465,7 +1465,7 @@ class BotiumConnectorVoip {
               if (!_.isNil(parsedData.data.start)) {
                 const silenceDuration = parsedData.data.start - this.prevData.data.end
                 const sttHandling = this.caps[Capabilities.VOIP_STT_MESSAGE_HANDLING]
-                const isJoinMethod = sttHandling === 'JOIN' || sttHandling === 'PSST'
+                const isJoinMethod = isBufferedSttHandling(sttHandling)
                 let matched = false
                 if (isJoinMethod) {
                   const joinTimeoutMs = this._getEffectiveJoinTimeoutMs(this.convoStep, this.botMsgs)
@@ -1615,7 +1615,16 @@ class BotiumConnectorVoip {
                 // New final arrived — reset extension budget for next pause.
                 this.psstRearmCount = 0
                 this.psstFirstRearmAt = null
-                armJoinSilenceTimer()
+                if (connector.turnHandler && connector.turnHandler.onFinalBuffered) {
+                  armJoinSilenceTimer()
+                } else if (this._realFlushBotMsgs) {
+                  this._realFlushBotMsgs()
+                } else {
+                  sendBotMsg(joinBotMsg(this.botMsgs, this.joinLastPrevMsg))
+                  this.firstMsg = false
+                  this.joinLastPrevMsg = this.botMsgs[this.botMsgs.length - 1]
+                  this.botMsgs = []
+                }
               }
             }
           }
