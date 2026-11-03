@@ -1,4 +1,4 @@
-const { test } = require('node:test')
+const { test, mock } = require('node:test')
 const assert = require('node:assert/strict')
 const { createTurnHandler } = require('../src/turn-handlers/create-turn-handler')
 const { NamoTurnHandler } = require('../src/turn-handlers/namo-turn-handler')
@@ -22,6 +22,64 @@ const Capabilities = {
   VOIP_NAMO_VAD_ENABLE: 'VOIP_NAMO_VAD_ENABLE',
   VOIP_STT_MESSAGE_HANDLING_DELIMITER: 'VOIP_STT_MESSAGE_HANDLING_DELIMITER'
 }
+
+test('NamoTurnHandler forceFlush prefers ctx.realFlush over flushBufferedBotMsgs when Namo is disabled', () => {
+  let legacyFlush = false
+  let realFlush = false
+  const ctx = {
+    botMsgs: [{ messageText: 'Call simulator.' }],
+    caps: {},
+    sessionId: 's-flush',
+    Capabilities,
+    _info: () => {},
+    debug: () => {},
+    markReplyTrace: () => {},
+    commitNamoFlush: () => {},
+    flushBufferedBotMsgs: () => { legacyFlush = true },
+    realFlush: () => { realFlush = true },
+    isJoinMethod: () => true,
+    inboundLane: null
+  }
+  const handler = new NamoTurnHandler(ctx)
+  handler.namoEnabled = false
+  handler.forceFlush('unit_test')
+  assert.equal(realFlush, true)
+  assert.equal(legacyFlush, false)
+})
+
+test('PsstTurnHandler timer flush prefers ctx.realFlush when present', () => {
+  mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    let legacyFlush = false
+    let realFlush = false
+    const { PsstTurnHandler } = require('../src/turn-handlers/psst-turn-handler')
+    const ctx = {
+      botMsgs: [{ messageText: 'hello' }],
+      caps: { [Capabilities.VOIP_STT_MESSAGE_HANDLING]: 'PSST' },
+      sessionId: 's-psst',
+      convoStep: null,
+      Capabilities,
+      _info: () => {},
+      debug: () => {},
+      markReplyTrace: () => {},
+      getEffectiveJoinTimeoutMs: () => 300,
+      getPsstLatencyGraceMs: () => 0,
+      isLastFinalNaturalEnd: () => true,
+      isJoinMethod: () => true,
+      flushBufferedBotMsgs: () => { legacyFlush = true },
+      realFlush: () => { realFlush = true },
+      eventEmitter: null,
+      stopCalled: false
+    }
+    const handler = new PsstTurnHandler(ctx)
+    handler.onFinalBuffered()
+    mock.timers.runAll()
+    assert.equal(realFlush, true)
+    assert.equal(legacyFlush, false)
+  } finally {
+    mock.timers.reset()
+  }
+})
 
 test('createTurnHandler always returns NamoTurnHandler', () => {
   const ctx = {
