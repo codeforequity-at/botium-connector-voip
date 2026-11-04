@@ -2247,7 +2247,15 @@ class BotiumConnectorVoip {
     const stream = this.audioStream
     if (!bytesPerSec || !stream || !stream.pcmParts.length) return null
     const startByte = Math.max(0, Math.floor(playedSec * bytesPerSec))
-    const pcm = Buffer.concat(stream.pcmParts)
+    // Cache the concatenated recording on the stream: this scan runs from the
+    // per-chunk audio handler, and Buffer.concat over every pcmPart per chunk is
+    // O(recording length) per chunk — O(n^2) over a call. On long calls that
+    // starved the event loop (worker pinned at ~120% CPU, coach turns stalled).
+    if (!stream._pcmConcatCache || stream._pcmConcatCacheBytes !== stream.totalBytes) {
+      stream._pcmConcatCache = Buffer.concat(stream.pcmParts)
+      stream._pcmConcatCacheBytes = stream.totalBytes
+    }
+    const pcm = stream._pcmConcatCache
     if (startByte >= pcm.length) return null
     const bitsPerSample = stream.format.bitsPerSample
     const leadInSec = this._findAudibleLeadInSecFromPcm(
@@ -2305,6 +2313,15 @@ class BotiumConnectorVoip {
 
   _maybeDetectAgentAudibleOnRecording (voipAgent) {
     if (!voipAgent || !_.isFinite(voipAgent.playedRecordingStartSec)) return
+    // Onset already located for this reply — never rescan (this runs per audio chunk).
+    if (_.isFinite(voipAgent.heardRecordingStartSec)) return
+    // Throttle: at most one scan per ~0.5s of newly arrived audio.
+    const scanStream = this.audioStream
+    if (scanStream && _.isFinite(scanStream.totalBytes)) {
+      const scanBytesPerSec = this._audioStreamBytesPerSec()
+      if (scanBytesPerSec && scanStream.totalBytes - (voipAgent._lastAudibleScanBytes || 0) < scanBytesPerSec * 0.5) return
+      voipAgent._lastAudibleScanBytes = scanStream.totalBytes
+    }
     this._applyAgentHeardRecordingStartSec(voipAgent)
   }
 
