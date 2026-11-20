@@ -7,6 +7,7 @@ const { AutoTokenizer, env } = require('@huggingface/transformers')
 const ort = require('onnxruntime-node')
 
 const { trackSession } = require('./onnx-lifecycle')
+const { cpuSessionOptions } = require('./onnx-session-options')
 
 const DEFAULT_MODEL_ID = 'videosdk-live/Namo-Turn-Detector-v1-English'
 const DEFAULT_MODEL_REVISION = '4dcc9713be5071ef43e510f72b1eefcb2f99cb04'
@@ -95,10 +96,8 @@ const loadModel = async (options) => {
 
   const [tokenizer, session] = await Promise.all([
     AutoTokenizer.from_pretrained(tokenizerSource, tokenizerOptions),
-    ort.InferenceSession.create(modelPath, {
-      executionProviders: ['cpu'],
-      graphOptimizationLevel: 'all'
-    }).then(session => trackSession(session))
+    ort.InferenceSession.create(modelPath, cpuSessionOptions({ graphOptimizationLevel: 'all' }))
+      .then(session => trackSession(session))
   ])
 
   log('namo_model_ready', {

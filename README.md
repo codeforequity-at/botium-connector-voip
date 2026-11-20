@@ -16,6 +16,7 @@ Only **committed** turns call `queueBotSays`. See [TURN-DETECTION.md](./TURN-DET
 
 - Namo: `~/.cache/botium/namo` or `BOTIUM_NAMO_CACHE_DIR`; override with `VOIP_NAMO_MODEL_PATH`.
 - TEN VAD: bundled asset or `VOIP_TEN_VAD_MODEL_PATH` / `BOTIUM_TEN_VAD_MODEL_PATH`.
+- ONNX threads: all models (TEN VAD, CED, Namo) run single-threaded by default so CPU-limited containers keep up with live audio. Set `BOTIUM_VOIP_ONNX_THREADS` to use more intra-op threads.
 
 Prefetch locally:
 
