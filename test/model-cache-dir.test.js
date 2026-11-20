@@ -21,9 +21,12 @@ test('uses ~/.cache/botium/<name> when home is writable', () => {
 
 test('falls back to tmpdir when home cannot be created (box-server ENOENT case)', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'voip-tmp-'))
+  // A path below a regular file can't be created even as root (ENOTDIR), unlike a missing /home.
+  const blocker = path.join(tmp, 'not-a-dir')
+  fs.writeFileSync(blocker, '')
   const dir = resolveModelCacheDir('namo', 'BOTIUM_NAMO_CACHE_DIR', {
     env: {},
-    homedir: () => '/nonexistent-root-for-test/home/node',
+    homedir: () => path.join(blocker, 'home', 'node'),
     tmpdir: () => tmp
   })
   assert.equal(dir, path.join(tmp, 'botium-cache', 'namo'))
