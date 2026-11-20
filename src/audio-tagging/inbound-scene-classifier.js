@@ -1,5 +1,6 @@
 const ort = require('onnxruntime-node')
 const { trackSession } = require('../onnx-lifecycle')
+const { cpuSessionOptions } = require('../onnx-session-options')
 const { loadLabelIndex, bundledLabelsPath } = require('./ced-tiny-model')
 const { computeCedFeats } = require('./ced-tiny-features')
 const { SAMPLE_RATE } = require('../inbound/inbound-lane')
@@ -43,9 +44,7 @@ class InboundSceneClassifier {
 
   async _ensureSession () {
     if (this._session || !this._enabled) return
-    this._session = trackSession(await ort.InferenceSession.create(this._modelPath, {
-      executionProviders: ['cpu']
-    }))
+    this._session = trackSession(await ort.InferenceSession.create(this._modelPath, cpuSessionOptions()))
     this._inputName = this._session.inputNames[0]
   }
 

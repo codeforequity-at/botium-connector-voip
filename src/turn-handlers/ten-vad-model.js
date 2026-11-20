@@ -1,5 +1,4 @@
 const fs = require('fs')
-const os = require('os')
 const path = require('path')
 const { Readable } = require('stream')
 const { pipeline } = require('stream/promises')
@@ -12,6 +11,7 @@ const TEN_VAD_UPSTREAM_REPO = 'https://github.com/TEN-framework/ten-vad'
 const TEN_VAD_SHERPA_REPO = 'https://github.com/k2-fsa/sherpa-onnx'
 const ONNX_FILENAME = 'ten-vad.int8.onnx'
 const { bundledModelPath: packageBundledModelPath, assetsModelsDir } = require('../package-assets')
+const { resolveModelCacheDir } = require('../model-cache-dir')
 
 const TEN_VAD_METADATA_HINT =
   'Expected sherpa asr-models ten-vad.int8.onnx with ONNX metadata; see assets/models/TEN-VAD.md'
@@ -20,12 +20,7 @@ let downloadPromise = null
 
 const bundledModelPath = () => packageBundledModelPath(ONNX_FILENAME)
 
-const defaultCacheDir = () => {
-  if (process.env.BOTIUM_TEN_VAD_CACHE_DIR) {
-    return process.env.BOTIUM_TEN_VAD_CACHE_DIR
-  }
-  return path.join(os.homedir(), '.cache', 'botium', 'ten-vad')
-}
+const defaultCacheDir = () => resolveModelCacheDir('ten-vad', 'BOTIUM_TEN_VAD_CACHE_DIR')
 
 const defaultCachePath = () => path.join(defaultCacheDir(), ONNX_FILENAME)
 
