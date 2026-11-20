@@ -13,13 +13,16 @@ const F_MAX = 8000
 const TOP_DB = 120
 
 let melFilters = null
+let cachedWindow = null
 
 const hannWindow = () => {
+  if (cachedWindow) return cachedWindow
   const w = new Float32Array(WIN_LENGTH)
   for (let i = 0; i < WIN_LENGTH; i++) {
     w[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (WIN_LENGTH - 1)))
   }
-  return w
+  cachedWindow = w
+  return cachedWindow
 }
 
 const buildMelFilters = () => {
@@ -60,18 +63,57 @@ const buildMelFilters = () => {
   return melFilters
 }
 
+// Iterative radix-2 FFT tables for N_FFT (power of two). This runs on the event loop for
+// every CED window (~97 frames), so a direct O(N^2) DFT is too slow for live calls.
+let fftTables = null
+
+const buildFftTables = () => {
+  if (fftTables) return fftTables
+  const bits = Math.log2(N_FFT)
+  const bitRev = new Uint16Array(N_FFT)
+  for (let i = 0; i < N_FFT; i++) {
+    let r = 0
+    for (let b = 0; b < bits; b++) r |= ((i >> b) & 1) << (bits - 1 - b)
+    bitRev[i] = r
+  }
+  const cos = new Float64Array(N_FFT / 2)
+  const sin = new Float64Array(N_FFT / 2)
+  for (let k = 0; k < N_FFT / 2; k++) {
+    cos[k] = Math.cos((2 * Math.PI * k) / N_FFT)
+    sin[k] = Math.sin((2 * Math.PI * k) / N_FFT)
+  }
+  fftTables = { bitRev, cos, sin, re: new Float64Array(N_FFT), im: new Float64Array(N_FFT) }
+  return fftTables
+}
+
 const rfft512Power = (frame, window, outPower) => {
+  const { bitRev, cos, sin, re, im } = buildFftTables()
+  for (let n = 0; n < N_FFT; n++) {
+    const src = bitRev[n]
+    re[n] = src < WIN_LENGTH ? frame[src] * window[src] : 0
+    im[n] = 0
+  }
+  for (let size = 2; size <= N_FFT; size <<= 1) {
+    const half = size >> 1
+    const step = N_FFT / size
+    for (let start = 0; start < N_FFT; start += size) {
+      for (let j = 0; j < half; j++) {
+        const wr = cos[j * step]
+        const wi = -sin[j * step]
+        const a = start + j
+        const b = a + half
+        const tr = re[b] * wr - im[b] * wi
+        const ti = re[b] * wi + im[b] * wr
+        re[b] = re[a] - tr
+        im[b] = im[a] - ti
+        re[a] += tr
+        im[a] += ti
+      }
+    }
+  }
   const numFreqs = N_FFT / 2 + 1
   for (let k = 0; k < numFreqs; k++) {
-    let re = 0
-    let im = 0
-    for (let n = 0; n < WIN_LENGTH; n++) {
-      const x = frame[n] * window[n]
-      const ang = (2 * Math.PI * k * n) / N_FFT
-      re += x * Math.cos(ang)
-      im -= x * Math.sin(ang)
-    }
-    outPower[k] = re * re + im * im
+    outPower[k] = re[k] * re[k] + im[k] * im[k]
   }
 }
 
@@ -129,5 +171,6 @@ const computeCedFeats = (waveform) => {
 
 module.exports = {
   SAMPLE_RATE,
-  computeCedFeats
+  computeCedFeats,
+  rfft512Power
 }
