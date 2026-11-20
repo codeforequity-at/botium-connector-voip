@@ -1,5 +1,4 @@
 const fs = require('fs')
-const os = require('os')
 const path = require('path')
 const { Readable } = require('stream')
 const { pipeline } = require('stream/promises')
@@ -8,6 +7,7 @@ const ort = require('onnxruntime-node')
 
 const { trackSession } = require('./onnx-lifecycle')
 const { cpuSessionOptions } = require('./onnx-session-options')
+const { resolveModelCacheDir } = require('./model-cache-dir')
 
 const DEFAULT_MODEL_ID = 'videosdk-live/Namo-Turn-Detector-v1-English'
 const DEFAULT_MODEL_REVISION = '4dcc9713be5071ef43e510f72b1eefcb2f99cb04'
@@ -118,7 +118,7 @@ class NamoDetector {
     modelId = DEFAULT_MODEL_ID,
     revision = DEFAULT_MODEL_REVISION,
     modelPath = null,
-    cacheDir = process.env.BOTIUM_NAMO_CACHE_DIR || path.join(os.homedir(), '.cache', 'botium', 'namo'),
+    cacheDir = resolveModelCacheDir('namo', 'BOTIUM_NAMO_CACHE_DIR'),
     maxLength = 512,
     log = () => {}
   } = {}) {
