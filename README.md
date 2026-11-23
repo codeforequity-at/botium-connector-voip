@@ -26,6 +26,7 @@ node scripts/prefetch-namo-model.cjs
 
 ### Key capabilities
 
+- `BOTIUM_VOIP_NAMO_X64_QUANT_PRECISION` (default `1`; set `0` to disable): enables onnxruntime `session.x64quantprecision` for Namo. Without it the int8 model returns ~0.137 for every sentence on x86_64 AVX2 CPUs.
 - `VOIP_NAMO_EOU_THRESHOLD` (default `0.85`)
 - `VOIP_NAMO_REOPEN_MS` (default `800`)
 - `VOIP_NAMO_MAX_WAIT_MS`, `VOIP_NAMO_EMIT_STABLE_MS`, `VOIP_NAMO_DTMF_ECHO_MS`

@@ -16,21 +16,41 @@ const resolveThreads = (env = process.env) => {
 
 const cpuSessionOptions = (extra = {}, env = process.env) => {
   const threads = resolveThreads(env)
+  const { extra: extraConfig, ...rest } = extra
   const options = {
     executionProviders: ['cpu'],
     intraOpNumThreads: threads,
     interOpNumThreads: 1,
     executionMode: 'sequential',
-    ...extra
+    ...rest
   }
+  const session = { ...(extraConfig && extraConfig.session) }
   if (threads === 1) {
     // No pool threads exist to spin; also stop spin-waits from the caller side.
-    options.extra = { session: { intra_op: { allow_spinning: '0' }, inter_op: { allow_spinning: '0' } } }
+    session.intra_op = { allow_spinning: '0' }
+    session.inter_op = { allow_spinning: '0' }
+  }
+  if (Object.keys(session).length > 0 || extraConfig) {
+    options.extra = { ...extraConfig, session }
   }
   return options
 }
 
+/**
+ * Namo ships as an int8-quantised model. onnxruntime's x86_64 AVX2 int8 GEMM kernel saturates
+ * on it and returns a near-constant ~0.137 for every sentence (so Namo never decides a turn is
+ * complete). `session.x64quantprecision=1` makes those kernels use higher-precision math: results
+ * then match the fp32 model. It has no effect on ARM or non-AVX2 paths.
+ * Set BOTIUM_VOIP_NAMO_X64_QUANT_PRECISION=0 to disable.
+ */
+const namoSessionOptions = (extra = {}, env = process.env) => {
+  const enabled = String(env.BOTIUM_VOIP_NAMO_X64_QUANT_PRECISION || '1') !== '0'
+  const session = enabled ? { x64quantprecision: '1' } : {}
+  return cpuSessionOptions({ ...extra, extra: { session } }, env)
+}
+
 module.exports = {
   cpuSessionOptions,
+  namoSessionOptions,
   resolveThreads
 }
