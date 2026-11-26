@@ -441,6 +441,7 @@ class BotiumConnectorVoip {
     this.fullRecordState = createFullRecordingState()
     this.end = false
     this.connected = false
+    this.callDisconnected = false
     this.sipCallId = null
     this.convoStep = null
     this._lastBotSaysQueuedAt = null
@@ -989,6 +990,24 @@ class BotiumConnectorVoip {
             reject(new Error(`${this.sessionId} - Websocket connection to ${wsEndpoint} error: ${err.message || err}`))
           }
         })
+        sessionWs.on('close', (code, reason) => {
+          if (this._sessionGeneration !== sessionGeneration || this.ws !== sessionWs) return
+          const reasonText = (reason && reason.toString()) || ''
+          if (this.stopCalled || this.end || this.callDisconnected) {
+            // Unblocks the Stop() wait when the worker closes without a final recording frame.
+            this.end = true
+            return
+          }
+          _info('ws_closed_unexpectedly', { sessionId: this.sessionId, code, reason: reasonText || null })
+          flushPendingBotMsgs('ws_closed')
+          if (typeof this._emitBufferedFullRecordIfAny === 'function') {
+            this._emitBufferedFullRecordIfAny('ws_closed_buffered')
+          }
+          this.end = true
+          const closeErr = new Error(`${this.sessionId} - Websocket connection to ${wsEndpoint} closed unexpectedly (code ${code}${reasonText ? `, ${reasonText}` : ''})`)
+          reject(closeErr)
+          sendBotMsg(closeErr)
+        })
         sessionWs.on('message', async (data) => {
           if (this._sessionGeneration !== sessionGeneration || this.ws !== sessionWs) {
             debug('Ignoring frame from stale VoIP websocket')
@@ -1220,6 +1239,7 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.type === 'callinfo' && parsedData.status === 'disconnected') {
+            this.callDisconnected = true
             _info('callinfo_disconnected', {
               sessionId: this.sessionId,
               connectDurationSec: parsedData.connectDuration || null,
@@ -1715,6 +1735,7 @@ class BotiumConnectorVoip {
         this.ws = null
         this.wsOpened = false
         this.end = false
+        this.callDisconnected = false
         setTimeout(() => {
           establishCall().catch(err => reject(new Error('Error: ' + err)))
         }, this.caps[Capabilities.VOIP_CALL_SETUP_RETRY_487_TIMEOUT])
