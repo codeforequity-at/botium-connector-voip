@@ -6,10 +6,12 @@ const _ = require('lodash')
 const axios = require('axios')
 const http = require('http')
 const https = require('https')
+const { randomUUID } = require('crypto')
 const debug = require('debug')('botium-connector-voip')
 const mm = require('music-metadata')
 const { formatConnectorInfoLine, formatWorkerLogLine, parseBoolean } = require('./worker-logging')
 const { createTurnHandler } = require('./turn-handlers/create-turn-handler')
+const { createSttEndRecovery } = require('./stt-end-recovery')
 const { resolveTenVadModelPath, parseTenVadMetadata } = require('./turn-handlers/ten-vad-model')
 const { resolveCedTinyModelPath } = require('./audio-tagging/ced-tiny-model')
 const { InboundLane } = require('./inbound/inbound-lane')
@@ -26,6 +28,14 @@ const {
   isEouHandling,
   isBufferedSttHandling
 } = require('./stt-message-handling')
+const {
+  appendFullRecordingChunk,
+  createFullRecordingState,
+  getFrameSessionId,
+  getFullRecordingBase64,
+  isFrameForSession,
+  resetFullRecordingState
+} = require('./full-recording')
 // Logging policy: info = rare, business-relevant lifecycle events (always visible).
 // debug = high-frequency diagnostics (DEBUG=botium-connector-voip). warn = degraded but continuing.
 // error = abort/failure. No secrets in info; STT text only as length or truncated in info.
@@ -316,6 +326,8 @@ class BotiumConnectorVoip {
     this._replyTrace = null
     this._activeUserSaysVoipAgent = null
     this._speculativeTurnToken = 0
+    this._sessionGeneration = 0
+    this._convoStepListener = null
   }
 
   async Validate () {
@@ -418,10 +430,15 @@ class BotiumConnectorVoip {
     debug('Start called')
     debug(this.caps[Capabilities.VOIP_TTS_URL])
 
+    if (this._sttEndRecovery) this._sttEndRecovery.clear()
     this.stopCalled = false
+    this._sessionGeneration++
+    const sessionGeneration = this._sessionGeneration
+    this.recordingId = randomUUID()
 
     this.fullRecord = ''
     this.fullRecordAttachmentEmitted = false
+    this.fullRecordState = createFullRecordingState()
     this.end = false
     this.connected = false
     this.sipCallId = null
@@ -645,12 +662,23 @@ class BotiumConnectorVoip {
     }
     const armJoinSilenceTimer = () => connector.turnHandler.onFinalBuffered()
 
+    const sttEndRecovery = createSttEndRecovery({
+      recover: () => flushPendingBotMsgs('disconnect_timeout')
+    })
+    this._sttEndRecovery = sttEndRecovery
+
     // Flush buffered STT chunks on teardown so a late final is not lost when
     // the PSST silence timer is cleared by Stop(). Falls back to the cached
     // interim transcript (`lastPartialBotMsg`) when STT never delivered a
     // final for the closing utterance. Must be called from every terminal
     // path before `this.end` is flipped.
     const flushPendingBotMsgs = (reason) => {
+      if (reason === 'callinfo_disconnected' &&
+        (!this.botMsgs || this.botMsgs.length === 0) && this.lastPartialBotMsg) {
+        sttEndRecovery.defer()
+        return
+      }
+      sttEndRecovery.clear()
       if (connector.turnHandler && connector.turnHandler.forceFlush) {
         connector.turnHandler.forceFlush(`flush:${reason}`)
       } else if (connector.turnHandler) {
@@ -692,6 +720,7 @@ class BotiumConnectorVoip {
           message: preview
         })
         debug(`Recovering last STT partial on ${reason} (no final arrived): "${preview}"`)
+        sttEndRecovery.markRecovered(recovered)
         sendBotMsg(recovered)
         this.firstMsg = false
         this.joinLastPrevMsg = recovered
@@ -838,7 +867,10 @@ class BotiumConnectorVoip {
         // working across 487 setup retries that swap out the websocket.
         if (!convoStepListenerAttached) {
           convoStepListenerAttached = true
-          this.eventEmitter.on('CONVO_STEP_NEXT', (container, convoStep) => {
+          if (this._convoStepListener) {
+            this.eventEmitter.removeListener('CONVO_STEP_NEXT', this._convoStepListener)
+          }
+          this._convoStepListener = (container, convoStep) => {
             this.convoStep = convoStep
             this._maybePrefetchTts(convoStep)
             // For PSST: send join silence duration per step to VOIP worker (controls PSST silence trigger)
@@ -857,7 +889,8 @@ class BotiumConnectorVoip {
             } catch (err) {
               debug(`Failed sending PSST silence duration to VOIP worker: ${err.message || err}`)
             }
-          })
+          }
+          this.eventEmitter.on('CONVO_STEP_NEXT', this._convoStepListener)
         }
 
         this.silence = null
@@ -945,16 +978,22 @@ class BotiumConnectorVoip {
           workerLogsEnable: request.WORKER_LOGS_ENABLE
         })
         debug(JSON.stringify(request, null, 2))
-        this.ws.send(JSON.stringify(request))
+        const sessionWs = this.ws
+        sessionWs.send(JSON.stringify(request))
 
-        this.ws.on('error', (err) => {
+        sessionWs.on('error', (err) => {
+          if (this._sessionGeneration !== sessionGeneration || this.ws !== sessionWs) return
           debug(err)
           if (!this.wsOpened) {
             this.end = true
             reject(new Error(`${this.sessionId} - Websocket connection to ${wsEndpoint} error: ${err.message || err}`))
           }
         })
-        this.ws.on('message', async (data) => {
+        sessionWs.on('message', async (data) => {
+          if (this._sessionGeneration !== sessionGeneration || this.ws !== sessionWs) {
+            debug('Ignoring frame from stale VoIP websocket')
+            return
+          }
           // Drop non-JSON gateway frames (rare, but crash the process without this guard).
           let parsedData
           try {
@@ -1060,6 +1099,10 @@ class BotiumConnectorVoip {
           }
 
           const emitFullRecordAttachment = (base64) => {
+            if (this.fullRecordAttachmentEmitted) {
+              debug(`${this.sessionId} - Full recording attachment already emitted, ignoring duplicate terminal frame`)
+              return false
+            }
             if (!base64 || typeof base64 !== 'string' || base64.length === 0) {
               // Log available fields (length only) to help diagnose worker payload shape without dumping base64
               try {
@@ -1077,7 +1120,7 @@ class BotiumConnectorVoip {
               } catch (err) {
                 debug(`${this.sessionId} - fullRecordEnd received but base64 is empty, skipping attachment emit (diag failed: ${err.message || err})`)
               }
-              return
+              return false
             }
             debug(`${this.sessionId} - Emitting MESSAGE_ATTACHMENT full_record.wav (base64Len=${base64.length}, stopCalled=${!!this.stopCalled})`)
             this.eventEmitter.emit('MESSAGE_ATTACHMENT', this.container, {
@@ -1087,19 +1130,24 @@ class BotiumConnectorVoip {
               // Session context from capabilities for correlation
               sessionContext: {
                 testSessionId: this.caps.VOIP_TEST_SESSION_ID || null,
-                testSessionJobId: this.caps.VOIP_TEST_SESSION_JOB_ID || null
+                testSessionJobId: this.caps.VOIP_TEST_SESSION_JOB_ID || null,
+                voipSessionId: this.sessionId || null,
+                recordingId: this.recordingId
               }
             })
             this.fullRecordAttachmentEmitted = true
+            return true
           }
           this._emitBufferedFullRecordIfAny = (reason) => {
             if (this.fullRecordAttachmentEmitted) return false
-            if (!this.fullRecord || typeof this.fullRecord !== 'string' || this.fullRecord.length === 0) return false
-            emitFullRecordAttachment(this.fullRecord)
+            const bufferedRecord = getFullRecordingBase64(this.fullRecordState)
+            if (!bufferedRecord) return false
+            emitFullRecordAttachment(bufferedRecord)
             _info('recording_attached', {
               sessionId: this.sessionId,
+              recordingId: this.recordingId,
               source: reason,
-              base64Len: this.fullRecord.length
+              base64Len: bufferedRecord.length
             })
             return true
           }
@@ -1119,9 +1167,12 @@ class BotiumConnectorVoip {
             }
           }
 
-          // if sessionId is not the same as the one in the callinfo, return
-          if (parsedData && parsedData.voipConfig && parsedData.voipConfig.sessionId && parsedData.voipConfig.sessionId !== this.sessionId) {
-            debug('sessionId mismatch, returning')
+          // Worker recording frames carry sessionId at the top level, while
+          // callinfo frames carry it in voipConfig. Validate both forms so a
+          // late frame can never be attached to a subsequent connector run.
+          const frameSessionId = getFrameSessionId(parsedData)
+          if (!isFrameForSession(parsedData, this.sessionId)) {
+            debug(`sessionId mismatch (${frameSessionId} !== ${this.sessionId}), returning`)
             return
           }
 
@@ -1270,17 +1321,27 @@ class BotiumConnectorVoip {
           // - some VOIP workers send the recording in chunks and an end marker
           if (parsedData && parsedData.type === 'fullRecordStart') {
             this.fullRecord = ''
+            resetFullRecordingState(this.fullRecordState)
           }
           if (parsedData && parsedData.type === 'fullRecordChunk') {
             const chunk = _extractFullRecordBase64(parsedData)
-            if (chunk) this.fullRecord = (this.fullRecord || '') + chunk
+            const seq = Number.isInteger(parsedData.seq) ? parsedData.seq : null
+            const appendResult = appendFullRecordingChunk(this.fullRecordState, chunk, seq)
+            if (appendResult === 'duplicate') {
+              debug(`${this.sessionId} - Ignoring duplicate fullRecordChunk seq=${seq}`)
+            } else if (appendResult === 'out-of-order') {
+              debug(`${this.sessionId} - Ignoring out-of-order fullRecordChunk seq=${seq}, expected=${this.fullRecordState.nextSeq}`)
+            }
           }
           if (parsedData && parsedData.type === 'fullRecordEnd') {
             const tail = _extractFullRecordBase64(parsedData)
-            if (tail) this.fullRecord = (this.fullRecord || '') + tail
-            const base64Len = (this.fullRecord || tail || '').length
-            emitFullRecordAttachment(this.fullRecord || tail)
-            _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecordEnd', base64Len })
+            if (tail) appendFullRecordingChunk(this.fullRecordState, tail, null)
+            this.fullRecord = getFullRecordingBase64(this.fullRecordState)
+            const base64Len = this.fullRecord.length
+            const emitted = emitFullRecordAttachment(this.fullRecord)
+            if (emitted) {
+              _info('recording_attached', { sessionId: this.sessionId, recordingId: this.recordingId, source: 'fullRecordEnd', base64Len })
+            }
             // Emit per-turn audio before `this.end = true` so it is captured by the
             // worker before Stop() resolves (no-op if audioStreamEnd already flushed).
             this._flushPendingTurnAudio('fullRecordEnd')
@@ -1384,8 +1445,10 @@ class BotiumConnectorVoip {
           if (parsedData && parsedData.type === 'fullRecord') {
             // Non-chunked full record
             const base64 = _extractFullRecordBase64(parsedData)
-            emitFullRecordAttachment(base64)
-            _info('recording_attached', { sessionId: this.sessionId, source: 'fullRecord', base64Len: (base64 || '').length })
+            const emitted = emitFullRecordAttachment(base64)
+            if (emitted) {
+              _info('recording_attached', { sessionId: this.sessionId, recordingId: this.recordingId, source: 'fullRecord', base64Len: (base64 || '').length })
+            }
             flushPendingBotMsgs('fullRecord')
             this.end = true
           }
@@ -1484,6 +1547,10 @@ class BotiumConnectorVoip {
           }
 
           if (parsedData && parsedData.data && parsedData.data.type === 'stt' && parsedData.data.final) {
+            if (!sttEndRecovery.acceptFinal(parsedData)) {
+              _info('stt_final_after_partial_recovery_ignored', { sessionId: this.sessionId })
+              return
+            }
             const confidenceThreshold = ((this._getConfidenceScoreLogicHook(this.convoStep) && this._getConfidenceScoreLogicHook(this.convoStep).args[0]) || this.caps[Capabilities.VOIP_STT_CONFIDENCE_THRESHOLD])
             const successfulConfidenceScore = this._getConfidenceScore(parsedData) >= confidenceThreshold
             const msgText = parsedData.data.message || ''
@@ -2531,46 +2598,65 @@ class BotiumConnectorVoip {
       this.turnHandler.clearTimer('stop')
       this.turnHandler.reset()
     }
-    if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+    const sessionWs = this.ws
+    if (sessionWs && sessionWs.readyState !== WebSocket.CLOSED) {
       const request = JSON.stringify({
         METHOD: 'stopCall',
         sessionId: this.sessionId
       })
-      this.ws.send(request)
+      if (sessionWs.readyState === WebSocket.OPEN) sessionWs.send(request)
       await new Promise(resolve => {
-        const stopTimeout = setTimeout(resolve, 100000)
-        this._stopWaitInterval = setInterval(() => {
-          if (this.end) {
-            clearTimeout(stopTimeout)
+        let settled = false
+        const finish = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(stopTimeout)
+          if (this._stopWaitInterval) {
             clearInterval(this._stopWaitInterval)
             this._stopWaitInterval = null
-            this.wsOpened = false
-            this.ws = null
-            this.end = false
-            this.convoStep = null
-            this.firstSttInfoReceived = false
-            resolve()
+          }
+          resolve()
+        }
+        const stopTimeout = setTimeout(() => {
+          debug(`${this.sessionId} - Timed out waiting for full recording`)
+          finish()
+        }, 100000)
+        this._stopWaitInterval = setInterval(() => {
+          if (this.end) {
+            finish()
           }
         }, 100)
       })
-      // Final guard: if worker never emitted fullRecordEnd/fullRecord but
-      // chunks were buffered, publish the attachment before teardown.
-      if (typeof this._emitBufferedFullRecordIfAny === 'function') {
-        this._emitBufferedFullRecordIfAny('stop_final_guard')
+    }
+
+    // Final guards are common to normal end, timeout and an already closed
+    // websocket. Both operations are idempotent.
+    if (typeof this._emitBufferedFullRecordIfAny === 'function') {
+      this._emitBufferedFullRecordIfAny('stop_final_guard')
+    }
+    this._flushPendingTurnAudio('stop_final_guard')
+    if (this._flushPendingBotMsgs) this._flushPendingBotMsgs('stop_final_guard')
+    if (this._sttEndRecovery) this._sttEndRecovery.clear()
+
+    if (sessionWs) {
+      try {
+        sessionWs.removeAllListeners()
+        if (sessionWs.readyState !== WebSocket.CLOSED) sessionWs.terminate()
+      } catch (err) {
+        debug(`${this.sessionId} - Websocket cleanup failed: ${err.message || err}`)
       }
-    } else {
-      this.wsOpened = false
-      this.ws = null
-      this.end = false
-      this.convoStep = null
-      this.firstSttInfoReceived = false
-      if (typeof this._emitBufferedFullRecordIfAny === 'function') {
-        this._emitBufferedFullRecordIfAny('stop_final_guard')
-      }
-      // Last-resort flush in case neither audioStreamEnd nor fullRecordEnd fired.
-      this._flushPendingTurnAudio('stop_final_guard')
+    }
+    if (this.ws === sessionWs) this.ws = null
+    this.wsOpened = false
+    this.end = false
+    this.convoStep = null
+    this.firstSttInfoReceived = false
+    if (this._convoStepListener) {
+      this.eventEmitter.removeListener('CONVO_STEP_NEXT', this._convoStepListener)
+      this._convoStepListener = null
     }
     this._emitBufferedFullRecordIfAny = null
+    this._sessionGeneration++
   }
 
   _isTtsCacheEnabled () {
